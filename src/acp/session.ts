@@ -1131,6 +1131,10 @@ export class PiAcpSession {
   }
 }
 
+export function extensionUiToolCallId(id: string): string {
+  return `pi-ui-${id}`
+}
+
 function extensionUiToolCall(id: string, ev: PiRpcEvent) {
   const method = stringProp(ev, 'method') ?? 'ui'
   const title = stringProp(ev, 'title') ?? `Pi ${method}`
@@ -1141,7 +1145,7 @@ function extensionUiToolCall(id: string, ev: PiRpcEvent) {
   }
 
   return {
-    toolCallId: `pi-ui-${id}`,
+    toolCallId: extensionUiToolCallId(id),
     title,
     kind: 'other' as const,
     status: 'pending' as const,

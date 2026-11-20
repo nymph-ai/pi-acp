@@ -215,6 +215,12 @@ The provider ID is available in `_meta["nymph.ai/fabric"].nativeToolCallId`.
 A call is pending until its retained result supplies success or failure. Pi
 does not record a separate per-tool cancellation outcome in these entries.
 
+With a Pi build that emits `extension_ui_cancelled` and
+`PI_RPC_EXTENSION_UI_WITHDRAWAL=1`, the v2 connector withdraws the matching
+generic ACP permission via `$/cancel_request` when Pi aborts or times out
+the dialog. Late approval is ignored and other dialogs are unaffected.
+Pi RPC execution abort remains turn-scoped.
+
 Set `PI_ACP_TYPED_PROMPT_RECEIPTS=1` with a Pi build that supports native
 `prompt_with_id.clientContent`. The v2 preview then advertises
 `_meta["nymph.ai/fabric"].keyedResourceLinkPrompts`. It stores the original

@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from 'node:util'
 import * as acp from '@agentclientprotocol/sdk'
 import * as v2 from 'acp-v2-sdk/experimental/v2/unstable'
 import { PiAcpAgent } from './agent.js'
-import type { PiAcpConnection, PiAcpSession, StopReason } from './session.js'
+import { extensionUiToolCallId, type PiAcpConnection, type PiAcpSession, type StopReason } from './session.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { getPiAcpDir } from './paths.js'
 import type { PiForkAnchor, PiRpcEvent, PiSessionEntry } from '../pi-rpc/process.js'
@@ -25,7 +25,13 @@ type Runtime = {
   failed: boolean
   closing: boolean
   permissions: AbortController
+  pendingDialogs: Map<string, AbortController>
   unsubscribe: () => void
+}
+
+function withdrawPermissions(runtime: Runtime): void {
+  runtime.permissions.abort()
+  for (const dialog of runtime.pendingDialogs.values()) dialog.abort()
 }
 
 function invalid(message: string): v2.RequestError {
@@ -273,7 +279,7 @@ class PiV2Agent {
   dispose(): void {
     for (const runtime of this.sessions.values()) {
       runtime.unsubscribe()
-      runtime.permissions.abort()
+      withdrawPermissions(runtime)
     }
     this.sessions.clear()
     this.agent.dispose()
@@ -471,7 +477,7 @@ class PiV2Agent {
   async cancel(sessionId: string): Promise<void> {
     const runtime = this.sessions.get(sessionId)
     if (!runtime || runtime.closing || runtime.work.size === 0) return
-    runtime.permissions.abort()
+    withdrawPermissions(runtime)
     await translateError(() => runtime.session.cancel())
   }
 
@@ -479,7 +485,7 @@ class PiV2Agent {
     const runtime = this.requireSession(sessionId)
     runtime.closing = true
     try {
-      runtime.permissions.abort()
+      withdrawPermissions(runtime)
       if (runtime.work.size > 0) await translateError(() => runtime.session.cancel())
       await Promise.allSettled(runtime.work)
       await runtime.output
@@ -528,9 +534,15 @@ class PiV2Agent {
       closing: false,
       failed: false,
       permissions: new AbortController(),
+      pendingDialogs: new Map(),
       unsubscribe: () => {}
     }
     runtime.unsubscribe = session.proc.onEvent(event => {
+      if (event.type === 'extension_ui_cancelled' && typeof event.id === 'string') {
+        runtime.pendingDialogs.get(extensionUiToolCallId(event.id))?.abort()
+        return
+      }
+      if (event.type === 'pi_acp_process_exit') withdrawPermissions(runtime)
       void this.enqueue(runtime, () => this.nativeEvent(runtime, event)).catch(reportEventError)
     })
     this.sessions.set(session.sessionId, runtime)
@@ -657,16 +669,23 @@ class PiV2Agent {
   }
 
   private async permission(params: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
+    const cancelled = { outcome: { outcome: 'cancelled' } } as const
     const runtime = this.sessions.get(params.sessionId)
-    if (!runtime || runtime.closing || runtime.permissions.signal.aborted) return { outcome: { outcome: 'cancelled' } }
-    const permissions = runtime.permissions
-    await this.enqueue(runtime, async () => {
-      await this.publishMessages(runtime, false)
-      runtime.state = { sessionUpdate: 'state_update', state: 'requires_action' }
-      await this.notify(runtime, runtime.state)
-    })
+    if (!runtime || runtime.closing || runtime.permissions.signal.aborted) return cancelled
+    const { toolCallId, title } = params.toolCall
+    if (runtime.pendingDialogs.has(toolCallId)) return cancelled
+    const dialog = new AbortController()
+    runtime.pendingDialogs.set(toolCallId, dialog)
+    const signal = AbortSignal.any([runtime.permissions.signal, dialog.signal])
     try {
-      const { toolCallId, title } = params.toolCall
+      await this.enqueue(runtime, async () => {
+        if (signal.aborted) return
+        await this.publishMessages(runtime, false)
+        if (signal.aborted || runtime.state.state === 'requires_action') return
+        runtime.state = { sessionUpdate: 'state_update', state: 'requires_action' }
+        await this.notify(runtime, runtime.state)
+      })
+      if (signal.aborted) return cancelled
       const retainedId = runtime.tools.activeId(toolCallId)
       const response = await this.client.request(
         v2.methods.client.session.requestPermission,
@@ -676,15 +695,25 @@ class PiV2Agent {
           ...(retainedId ? { subject: { type: 'tool_call', toolCall: { toolCallId: retainedId } } } : {}),
           options: params.options
         },
-        { cancellationSignal: permissions.signal }
+        { cancellationSignal: signal, stopWaitingOnCancel: true }
       )
-      if (response.outcome.outcome === 'selected' && typeof response.outcome.optionId === 'string') {
+      if (!signal.aborted && response.outcome.outcome === 'selected' && typeof response.outcome.optionId === 'string') {
         return { outcome: { outcome: 'selected', optionId: response.outcome.optionId } }
       }
-      return { outcome: { outcome: 'cancelled' } }
+      return cancelled
+    } catch (error) {
+      if (signal.aborted) return cancelled
+      throw error
     } finally {
+      runtime.pendingDialogs.delete(toolCallId)
       await this.enqueue(runtime, async () => {
-        if (runtime.closing || permissions.signal.aborted || runtime.state.state !== 'requires_action') return
+        if (
+          runtime.closing ||
+          runtime.permissions.signal.aborted ||
+          runtime.pendingDialogs.size > 0 ||
+          runtime.state.state !== 'requires_action'
+        )
+          return
         runtime.state = { sessionUpdate: 'state_update', state: 'running' }
         await this.notify(runtime, runtime.state)
       })
