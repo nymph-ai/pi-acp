@@ -266,6 +266,11 @@ export class PiAcpAgent implements ACPAgent {
     return { session, configOptions: (await getSessionConfiguration(session.proc)).configOptions }
   }
 
+  async resumeForkedSession(sessionId: string, cwd: string, sessionFile: string) {
+    this.store.upsert({ sessionId, cwd, sessionFile })
+    return this.resumeActiveSession(sessionId, cwd)
+  }
+
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
     // We currently only support ACP protocol version 1.
     const supportedVersion = 1

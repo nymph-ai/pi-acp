@@ -218,8 +218,16 @@ The method accepts text and resource links. Pass `_meta.steering.idempotencyKey`
 and `idleBehavior: "promptRequired"` to retry safely. An idle session leaves
 new input unconsumed, and a retained receipt is reusable after restart.
 
-Cursor replay and forks, client MCP setup, additional roots, and terminal or tool replay
-are outside this preview. This mode is intended for single-owner native Pi
+Set `PI_ACP_NATIVE_CURSORS=1` with a Pi build that provides
+[`fork_snapshot`](https://github.com/nymph-ai/pi/commit/1bb09de31b75fc1d0148512c3c68ec1014f42dfa).
+This adds `session/fork` and emits stable fork cursors before user messages
+and after tool-free assistant messages. The native snapshot creates a
+separate session with the exact history before the cursor. Omitting the
+cursor copies the whole current branch after it settles. Keep the Pi ACP
+home and native session store across restarts to retain cursor validity.
+
+Cursor-based resume, tool, thought, session-message and compaction anchors,
+client MCP setup, additional roots, and terminal or tool replay are outside this preview. This mode is intended for single-owner native Pi
 sessions, including `fabd` session mode.
 
 ## Limitations

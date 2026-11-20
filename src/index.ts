@@ -51,7 +51,10 @@ const output = new ReadableStream<Uint8Array>({
 const stream = ndJsonStream(input, output)
 
 let legacyAgent: PiAcpAgent | undefined
-const router = process.env.PI_ACP_PROTOCOL_V2 === '1' ? piAgentRouter(process.env.PI_ACP_ACTIVE_STEERING === '1') : null
+const router =
+  process.env.PI_ACP_PROTOCOL_V2 === '1'
+    ? piAgentRouter(process.env.PI_ACP_ACTIVE_STEERING === '1', process.env.PI_ACP_NATIVE_CURSORS === '1')
+    : null
 if (router) {
   router.connect(stream as Parameters<typeof router.connect>[0])
 } else {

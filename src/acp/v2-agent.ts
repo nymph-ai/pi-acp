@@ -1,11 +1,13 @@
-import { createHash, randomUUID } from 'node:crypto'
-import { isAbsolute } from 'node:path'
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
+import { linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { isAbsolute, join } from 'node:path'
 import * as acp from '@agentclientprotocol/sdk'
 import * as v2 from 'acp-v2-sdk/experimental/v2/unstable'
 import { PiAcpAgent } from './agent.js'
 import type { PiAcpConnection, PiAcpSession, StopReason } from './session.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
-import type { PiRpcEvent, PiSessionEntry } from '../pi-rpc/process.js'
+import { getPiAcpDir } from './paths.js'
+import type { PiForkAnchor, PiRpcEvent, PiSessionEntry } from '../pi-rpc/process.js'
 
 type StateNotification = Extract<v2.SessionUpdate, { sessionUpdate: 'state_update' }>
 type Runtime = {
@@ -146,13 +148,62 @@ function nativeMessageId(sessionId: string, key: string | undefined | null): str
           .digest('hex')
 }
 
+function cursorSigningKey(): Uint8Array {
+  const directory = getPiAcpDir()
+  const path = join(directory, 'v2-cursor-key')
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  try {
+    return readCursorKey()
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+
+  const temporary = path + '.' + randomUUID()
+  try {
+    writeFileSync(temporary, randomBytes(32), { flag: 'wx', mode: 0o600 })
+    try {
+      linkSync(temporary, path)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    }
+  } finally {
+    rmSync(temporary, { force: true })
+  }
+  return readCursorKey()
+
+  function readCursorKey(): Uint8Array {
+    const bytes = readFileSync(path)
+    if (bytes.length !== 32) throw new Error('Pi ACP has an invalid cursor signing key')
+    return bytes
+  }
+}
+
+function entryMessageId(entry: PiSessionEntry): string {
+  return entry.clientSubmission?.messageId ?? `pi-entry:${entry.id}`
+}
+
+function cursorAnchor(entry: PiSessionEntry): PiForkAnchor | undefined {
+  if (entry.type !== 'message') return undefined
+  if (entry.message?.role === 'user') return { entryId: entry.id, position: 'before' }
+  const content: unknown = entry.message?.content
+  if (
+    entry.message?.role === 'assistant' &&
+    Array.isArray(content) &&
+    !content.some(block => typeof block === 'object' && block?.type === 'toolCall')
+  ) {
+    return { entryId: entry.id, position: 'after' }
+  }
+}
+
 class PiV2Agent {
   private readonly agent: PiAcpAgent
   private readonly sessions = new Map<string, Runtime>()
+  private cursorKey?: Uint8Array
 
   constructor(
     private readonly client: Pick<v2.AgentContext, 'notify' | 'request'>,
-    private readonly activeSteering: boolean
+    private readonly activeSteering: boolean,
+    private readonly nativeCursors: boolean
   ) {
     const connection: PiAcpConnection = {
       sessionUpdate: params => this.legacyUpdate(params),
@@ -172,10 +223,11 @@ class PiV2Agent {
 
   async initialize(): Promise<v2.InitializeResponse> {
     const legacy = await this.agent.initialize({ protocolVersion: 1 })
+    if (this.nativeCursors && !this.cursorKey) this.cursorKey = cursorSigningKey()
     return {
       protocolVersion: 2,
       info: legacy.agentInfo ?? { name: 'pi-acp', version: 'development' },
-      capabilities: { session: { prompt: { image: {} }, delete: {} } },
+      capabilities: { session: { prompt: { image: {} }, delete: {}, ...(this.nativeCursors ? { fork: {} } : {}) } },
       _meta: {
         'nymph.ai/fabric': { keyedTextPrompts: true, ...(this.activeSteering ? { keyedTextSteering: true } : {}) },
         ...(this.activeSteering ? { steering: { supported: true } } : {})
@@ -218,6 +270,44 @@ class PiV2Agent {
       await this.notify(runtime, runtime.state)
     })
     return { configOptions: configure(configOptions) }
+  }
+
+  async forkSession(params: v2.ForkSessionRequest, signal: AbortSignal): Promise<v2.ForkSessionResponse> {
+    validateRoots(params)
+    signal.throwIfAborted()
+    const { session: source } = await translateError(() => this.agent.resumeActiveSession(params.sessionId, params.cwd))
+    let anchor: PiForkAnchor | undefined
+    if (params.cursorId != null) {
+      const { entries, leafId } = await source.proc.getEntries()
+      for (const entry of branch(entries, leafId)) {
+        const candidate = cursorAnchor(entry)
+        if (candidate && this.cursorId(params.sessionId, candidate) === params.cursorId) {
+          anchor = candidate
+          break
+        }
+      }
+      if (!anchor) throw invalid('The cursor does not identify a supported point on this Pi session branch')
+    }
+    signal.throwIfAborted()
+    const fork = await source.proc.forkSnapshot(anchor)
+    if (!fork) throw invalid('The cursor no longer belongs to this Pi session branch')
+    const { session, configOptions } = await translateError(() =>
+      this.agent.resumeForkedSession(fork.sessionId, params.cwd, fork.sessionFile)
+    )
+    const runtime = this.track(session)
+    const { entries, leafId } = await session.proc.getEntries()
+    for (const entry of branch(entries, leafId)) runtime.seen.add(entry.id)
+    return { sessionId: fork.sessionId, configOptions: configure(configOptions) }
+  }
+
+  private cursorId(sessionId: string, anchor: PiForkAnchor): string {
+    if (!this.cursorKey) throw new Error('Pi ACP cursor support is not initialized')
+    return (
+      'pi-cursor:' +
+      createHmac('sha256', this.cursorKey)
+        .update(JSON.stringify([sessionId, anchor.entryId, anchor.position]))
+        .digest('base64url')
+    )
   }
 
   async prompt(params: v2.PromptRequest, signal: AbortSignal): Promise<v2.PromptResponse> {
@@ -398,8 +488,7 @@ class PiV2Agent {
       if (entry.type !== 'message' || !entry.message || (!replay && runtime.seen.has(entry.id))) continue
       const { role, content } = entry.message
       const submission = entry.clientSubmission
-      const messageId =
-        submission?.sessionId === runtime.session.sessionId ? submission.messageId : `pi-entry:${entry.id}`
+      const messageId = entryMessageId(entry)
       if (role === 'user' && submission?.sessionId === runtime.session.sessionId) runtime.receipts.add(messageId)
       if (role === 'user' || role === 'assistant') {
         const text = role === 'user' ? normalizePiMessageText(content) : normalizePiAssistantText(content)
@@ -417,6 +506,18 @@ class PiV2Agent {
             ? { sessionUpdate: 'user_message', messageId, content: blocks }
             : { sessionUpdate: 'agent_message', messageId, content: blocks }
         )
+        const anchor = this.nativeCursors ? cursorAnchor(entry) : undefined
+        if (anchor) {
+          await this.notify(runtime, {
+            sessionUpdate: 'cursor_update',
+            cursorId: this.cursorId(runtime.session.sessionId, anchor),
+            anchor:
+              role === 'user'
+                ? { type: 'user_message', messageId, position: anchor.position }
+                : { type: 'agent_message', messageId, position: anchor.position },
+            capabilities: { fork: {} }
+          })
+        }
       }
       runtime.seen.add(entry.id)
     }
@@ -488,13 +589,13 @@ function reportEventError(error: unknown): void {
   process.stderr.write(`pi-acp: v2 event failed: ${String(error)}\n`)
 }
 
-export function piAgentRouter(activeSteering = false) {
+export function piAgentRouter(activeSteering = false, nativeCursors = false) {
   let active: PiV2Agent
   let dispose: (() => void) | undefined
   const standard = v2
     .agent({ name: 'pi-acp' })
     .onConnect(({ client, signal }) => {
-      active = new PiV2Agent(client, activeSteering)
+      active = new PiV2Agent(client, activeSteering, nativeCursors)
       dispose = () => active.dispose()
       signal.addEventListener('abort', dispose, { once: true })
     })
@@ -507,9 +608,12 @@ export function piAgentRouter(activeSteering = false) {
     .onRequest(v2.methods.agent.session.close, ctx => active.close(ctx.params.sessionId))
     .onRequest(v2.methods.agent.session.delete, ctx => active.delete(ctx.params.sessionId))
     .onRequest(v2.methods.agent.session.setConfigOption, ctx => active.setConfig(ctx.params))
-  const experimental = activeSteering
+  const steering = activeSteering
     ? standard.onRequest('_session/steering', parseSteering, ctx => active.steer(ctx.params, ctx.signal))
     : standard
+  const experimental = nativeCursors
+    ? steering.onRequest(v2.methods.agent.session.fork, ctx => active.forkSession(ctx.params, ctx.signal))
+    : steering
   const router = v2
     .agentProtocolRouter()
     .withV1({

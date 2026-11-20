@@ -31,6 +31,7 @@ function stripAnsi(s: string): string {
 type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
   | { type: 'prompt_with_id'; id?: string; message: string; images?: unknown[]; clientMessageId: string }
+  | { type: 'fork_snapshot'; id?: string; anchor?: PiForkAnchor }
   | { type: 'steer_with_id'; id?: string; message: string; clientMessageId: string }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
@@ -78,6 +79,8 @@ export type PiPromptInsertion = {
   entryId: string
   disposition: 'inserted' | 'reused'
 }
+export type PiForkAnchor = { entryId: string; position: 'before' | 'after' }
+export type PiForkSession = { sessionId: string; sessionFile: string }
 export type PiSessionEntry = {
   id: string
   parentId: string | null
@@ -400,6 +403,22 @@ export class PiRpcProcess {
     const res = await this.request({ type: 'get_messages' })
     if (!res.success) throw new Error(`pi get_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
+  }
+
+  async forkSnapshot(anchor?: PiForkAnchor): Promise<PiForkSession | null> {
+    const res = await this.request({ type: 'fork_snapshot', anchor })
+    if (!res.success) throw new Error(`pi fork_snapshot failed: ${res.error ?? JSON.stringify(res.data)}`)
+    if (res.data === null) return null
+    const data = res.data as Partial<PiForkSession> | undefined
+    if (
+      typeof data?.sessionId !== 'string' ||
+      !data.sessionId ||
+      typeof data.sessionFile !== 'string' ||
+      !data.sessionFile
+    ) {
+      throw new Error('Pi returned an invalid native fork')
+    }
+    return { sessionId: data.sessionId, sessionFile: data.sessionFile }
   }
 
   async getEntries(): Promise<{ entries: PiSessionEntry[]; leafId: string | null }> {
