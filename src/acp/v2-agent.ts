@@ -8,6 +8,7 @@ import type { PiAcpConnection, PiAcpSession, StopReason } from './session.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { getPiAcpDir } from './paths.js'
 import type { PiForkAnchor, PiRpcEvent, PiSessionEntry } from '../pi-rpc/process.js'
+import { PiToolUpdates } from './v2-tools.js'
 
 const FABRIC_CURSOR_REPLAY = '_fabric_cursor'
 
@@ -16,6 +17,7 @@ type Runtime = {
   session: PiAcpSession
   seen: Set<string>
   receipts: Set<string>
+  tools: PiToolUpdates
   work: Set<Promise<StopReason>>
   output: Promise<void>
   state: StateNotification
@@ -458,6 +460,7 @@ class PiV2Agent {
       session,
       seen: new Set(),
       receipts: new Set(),
+      tools: new PiToolUpdates(),
       work: new Set(),
       output: Promise.resolve(),
       state: idle(),
@@ -496,9 +499,12 @@ class PiV2Agent {
           event.message &&
           typeof event.message === 'object' &&
           'role' in event.message &&
-          event.message.role === 'assistant'
+          (event.message.role === 'assistant' || event.message.role === 'toolResult')
         )
           await this.publishMessages(runtime, false)
+        break
+      case 'tool_execution_start':
+        await this.publishMessages(runtime, false)
         break
       case 'turn_end': {
         const message = event.message as { role?: string; stopReason?: string } | null | undefined
@@ -506,6 +512,7 @@ class PiV2Agent {
         break
       }
       case 'agent_settled': {
+        await this.publishMessages(runtime, false)
         const stop = event.aborted === true ? 'cancelled' : runtime.failed ? 'error' : 'end_turn'
         runtime.state = idle(stop)
         await this.notify(runtime, runtime.state)
@@ -522,6 +529,7 @@ class PiV2Agent {
   }
 
   private async publishMessages(runtime: Runtime, replay: boolean, history?: PiSessionEntry[]): Promise<void> {
+    const tools = replay ? new PiToolUpdates() : runtime.tools
     for (const entry of history ?? (await retainedBranch(runtime.session))) {
       if (entry.type !== 'message' || !entry.message || (!replay && runtime.seen.has(entry.id))) continue
       const { role, content } = entry.message
@@ -544,6 +552,9 @@ class PiV2Agent {
             ? { sessionUpdate: 'user_message', messageId, content: blocks }
             : { sessionUpdate: 'agent_message', messageId, content: blocks }
         )
+        if (role === 'assistant') {
+          for (const tool of tools.start(entry.id, content)) await this.notify(runtime, tool)
+        }
         const anchor = this.nativeCursors ? cursorAnchor(entry) : undefined
         if (anchor) {
           await this.notify(runtime, {
@@ -556,6 +567,10 @@ class PiV2Agent {
             capabilities: { fork: {} }
           })
         }
+      }
+      if (role === 'toolResult') {
+        const tool = tools.finish(entry.message)
+        if (tool) await this.notify(runtime, tool)
       }
       runtime.seen.add(entry.id)
     }
@@ -573,19 +588,6 @@ class PiV2Agent {
       case 'usage_update':
         await this.enqueue(runtime, () => this.notify(runtime, { ...update, sessionUpdate: 'usage_update' }))
         break
-      case 'tool_call':
-      case 'tool_call_update': {
-        const { content, ...fields } = update
-        const display = content?.filter(item => item.type === 'content')
-        await this.enqueue(runtime, () =>
-          this.notify(runtime, {
-            ...fields,
-            sessionUpdate: 'tool_call_update',
-            ...(display ? { content: display as v2.ToolCallContent[] } : {})
-          })
-        )
-        break
-      }
     }
   }
 
@@ -594,17 +596,19 @@ class PiV2Agent {
     if (!runtime || runtime.closing || runtime.permissions.signal.aborted) return { outcome: { outcome: 'cancelled' } }
     const permissions = runtime.permissions
     await this.enqueue(runtime, async () => {
+      await this.publishMessages(runtime, false)
       runtime.state = { sessionUpdate: 'state_update', state: 'requires_action' }
       await this.notify(runtime, runtime.state)
     })
     try {
       const { toolCallId, title } = params.toolCall
+      const retainedId = runtime.tools.activeId(toolCallId)
       const response = await this.client.request(
         v2.methods.client.session.requestPermission,
         {
           sessionId: params.sessionId,
           title: title ?? 'Pi requests permission',
-          subject: { type: 'tool_call', toolCall: { toolCallId } },
+          ...(retainedId ? { subject: { type: 'tool_call', toolCall: { toolCallId: retainedId } } } : {}),
           options: params.options
         },
         { cancellationSignal: permissions.signal }

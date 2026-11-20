@@ -85,7 +85,14 @@ export type PiSessionEntry = {
   id: string
   parentId: string | null
   type: string
-  message?: { role: string; content: unknown }
+  message?: {
+    role: string
+    content: unknown
+    toolCallId?: unknown
+    toolName?: unknown
+    isError?: unknown
+    details?: unknown
+  }
   clientSubmission?: { sessionId: string; messageId: string }
 }
 

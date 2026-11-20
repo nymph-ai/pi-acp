@@ -209,7 +209,11 @@ updates. Prompts acknowledge native insertion and support
 `_meta["nymph.ai/fabric"].keyedTextPrompts`. Resuming with `replayFrom: { "type": "start" }`
 replays retained messages from the native session branch using the original
 keyed IDs. Assistant text is delivered as a whole message when Pi records it.
-Live tool status updates use v2 tool calls.
+Live updates and replay project retained assistant tool calls and their native
+results. The ACP tool ID names the native assistant entry and block position.
+The provider ID is available in `_meta["nymph.ai/fabric"].nativeToolCallId`.
+A call is pending until its retained result supplies success or failure. Pi
+does not record a separate per-tool cancellation outcome in these entries.
 
 Set `PI_ACP_ACTIVE_STEERING=1` with a Pi build that provides the
 [`steer_with_id` native RPC](https://github.com/nymph-ai/pi/commit/74b30313699c6d628f945b0558e1b294c4fd3118). This adds `_session/steering` and advertises
@@ -235,7 +239,7 @@ Pi emits `replay_complete` even at the end of the branch. Unknown, stale,
 and cross-session cursors fail with `-32602`.
 
 Tool, thought, session-message and compaction anchors, client MCP setup,
-additional roots, and terminal or tool replay are outside this preview. This mode is intended for single-owner native Pi
+additional roots, and terminal replay are outside this preview. This mode is intended for single-owner native Pi
 sessions, including `fabd` session mode.
 
 ## Limitations
