@@ -311,6 +311,36 @@ export class PiRpcProcess {
     }
   }
 
+  /** Wait for the native shutdown hooks and process exit before reopening its session. */
+  async shutdown(): Promise<void> {
+    if (await this.signalAndWaitForExit('SIGTERM', 15_000)) return
+    if (await this.signalAndWaitForExit('SIGKILL', 5_000)) {
+      throw new Error('Pi did not complete native shutdown before forced termination')
+    }
+    throw new Error('The Pi process did not exit after forced termination')
+  }
+
+  private signalAndWaitForExit(signal: NodeJS.Signals, timeoutMs: number): Promise<boolean> {
+    const child = this.child
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
+    return new Promise(resolve => {
+      const finish = (exited: boolean) => {
+        clearTimeout(timer)
+        child.off('exit', onExit)
+        resolve(exited)
+      }
+      const onExit = () => finish(true)
+      const timer = setTimeout(() => finish(false), timeoutMs)
+      timer.unref()
+      child.once('exit', onExit)
+      try {
+        child.kill(signal)
+      } catch {
+        finish(false)
+      }
+    })
+  }
+
   /**
    * Human-readable stdout lines emitted before RPC NDJSON begins (e.g. Context/Skills/Extensions info).
    * Themes are typically noisy/less useful for ACP, so callers can filter as needed.

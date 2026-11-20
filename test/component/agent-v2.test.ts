@@ -90,6 +90,10 @@ class Session extends FakePiRpcProcess {
     this.disposed = true
   }
 
+  async shutdown() {
+    this.dispose()
+  }
+
   private append(entry: PiSessionEntry) {
     this.entries.push(entry)
     writeFileSync(this.file, this.entries.map(item => JSON.stringify(item)).join('\n') + '\n')

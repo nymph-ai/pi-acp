@@ -338,6 +338,7 @@ class PiV2Agent {
     const channelReply = channelReplyScope(params.mcpServers, sessionId, this.channelReply)
     const cursorId = this.replayCursorId(params.replayFrom)
     const kept = this.sessions.get(sessionId)
+    if (kept?.closing) throw new v2.RequestError(-32002, 'Session is closing')
     if (kept && !isDeepStrictEqual(kept.channelReply, channelReply)) {
       throw invalid('Close the active Pi session before changing its channel reply scope')
     }
@@ -521,8 +522,14 @@ class PiV2Agent {
       await runtime.output
     } finally {
       runtime.unsubscribe()
-      this.agent.closeActiveSession(sessionId)
-      this.sessions.delete(sessionId)
+      try {
+        await runtime.session.proc.shutdown()
+      } finally {
+        if (this.sessions.get(sessionId) === runtime) {
+          this.agent.closeActiveSession(sessionId)
+          this.sessions.delete(sessionId)
+        }
+      }
     }
     return {}
   }
