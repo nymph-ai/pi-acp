@@ -226,8 +226,16 @@ separate session with the exact history before the cursor. Omitting the
 cursor copies the whole current branch after it settles. Keep the Pi ACP
 home and native session store across restarts to retain cursor validity.
 
-Cursor-based resume, tool, thought, session-message and compaction anchors,
-client MCP setup, additional roots, and terminal or tool replay are outside this preview. This mode is intended for single-owner native Pi
+For a retained cursor, send `session/resume` with
+`replayFrom: { "type": "_fabric_cursor", "cursorId": "…" }`. This Pi
+extension is advertised in `_meta["nymph.ai/fabric"].replayFromCursor`.
+The replay starts at the cursor position. A before-user cursor includes
+that user message, and an after-assistant cursor starts with its successor.
+Pi emits `replay_complete` even at the end of the branch. Unknown, stale,
+and cross-session cursors fail with `-32602`.
+
+Tool, thought, session-message and compaction anchors, client MCP setup,
+additional roots, and terminal or tool replay are outside this preview. This mode is intended for single-owner native Pi
 sessions, including `fabd` session mode.
 
 ## Limitations

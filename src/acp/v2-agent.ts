@@ -9,6 +9,8 @@ import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi
 import { getPiAcpDir } from './paths.js'
 import type { PiForkAnchor, PiRpcEvent, PiSessionEntry } from '../pi-rpc/process.js'
 
+const FABRIC_CURSOR_REPLAY = '_fabric_cursor'
+
 type StateNotification = Extract<v2.SessionUpdate, { sessionUpdate: 'state_update' }>
 type Runtime = {
   session: PiAcpSession
@@ -64,6 +66,11 @@ function branch(entries: PiSessionEntry[], leafId: string | null): PiSessionEntr
     leafId = entry.parentId
   }
   return result.reverse()
+}
+
+async function retainedBranch(session: PiAcpSession): Promise<PiSessionEntry[]> {
+  const { entries, leafId } = await session.proc.getEntries()
+  return branch(entries, leafId)
 }
 
 function idle(reason?: StopReason): StateNotification {
@@ -229,7 +236,11 @@ class PiV2Agent {
       info: legacy.agentInfo ?? { name: 'pi-acp', version: 'development' },
       capabilities: { session: { prompt: { image: {} }, delete: {}, ...(this.nativeCursors ? { fork: {} } : {}) } },
       _meta: {
-        'nymph.ai/fabric': { keyedTextPrompts: true, ...(this.activeSteering ? { keyedTextSteering: true } : {}) },
+        'nymph.ai/fabric': {
+          keyedTextPrompts: true,
+          ...(this.activeSteering ? { keyedTextSteering: true } : {}),
+          ...(this.nativeCursors ? { replayFromCursor: FABRIC_CURSOR_REPLAY } : {})
+        },
         ...(this.activeSteering ? { steering: { supported: true } } : {})
       }
     }
@@ -250,44 +261,61 @@ class PiV2Agent {
 
   async resumeSession(params: v2.ResumeSessionRequest): Promise<v2.ResumeSessionResponse> {
     validateRoots(params)
-    if (params.replayFrom != null && params.replayFrom.type !== 'start') {
-      throw invalid('Pi only supports replay from the start of the retained branch')
-    }
+    const cursorId = this.replayCursorId(params.replayFrom)
     const { session, configOptions } = await translateError(() =>
       this.agent.resumeActiveSession(params.sessionId, params.cwd)
     )
+    const preflight =
+      cursorId !== undefined && !this.sessions.has(params.sessionId)
+        ? await this.replayPlan(session, cursorId)
+        : undefined
     const kept = this.sessions.get(params.sessionId)
     const runtime = kept ?? this.track(session)
     if (runtime.closing) throw new v2.RequestError(-32002, 'Session is closing')
     await this.enqueue(runtime, async () => {
       if (params.replayFrom) {
-        await this.publishMessages(runtime, true)
+        const plan = kept ? undefined : preflight
+        const { entries, from } = plan ?? (await this.replayPlan(session, cursorId))
+        for (const entry of entries.slice(0, from)) runtime.seen.add(entry.id)
+        await this.publishMessages(runtime, true, entries.slice(from))
         await this.notify(runtime, { sessionUpdate: 'replay_complete' })
       } else if (!kept) {
-        const { entries, leafId } = await session.proc.getEntries()
-        for (const entry of branch(entries, leafId)) runtime.seen.add(entry.id)
+        for (const entry of await retainedBranch(session)) runtime.seen.add(entry.id)
       }
       await this.notify(runtime, runtime.state)
     })
     return { configOptions: configure(configOptions) }
   }
 
+  private replayCursorId(replayFrom: v2.ReplayFrom | null | undefined): string | undefined {
+    if (replayFrom == null || replayFrom.type === 'start') return undefined
+    if (!this.nativeCursors || replayFrom.type !== FABRIC_CURSOR_REPLAY) {
+      throw invalid('Pi does not support this replay cursor type')
+    }
+    if (typeof replayFrom.cursorId !== 'string' || !/^pi-cursor:[A-Za-z0-9_-]{43}$/.test(replayFrom.cursorId)) {
+      throw invalid('Pi cursor replay requires an issued cursorId')
+    }
+    return replayFrom.cursorId
+  }
+
+  private async replayPlan(
+    session: PiAcpSession,
+    cursorId?: string
+  ): Promise<{ entries: PiSessionEntry[]; from: number }> {
+    const entries = await retainedBranch(session)
+    if (cursorId === undefined) return { entries, from: 0 }
+    const { index, anchor } = this.findCursor(entries, session.sessionId, cursorId)
+    return { entries, from: index + (anchor.position === 'after' ? 1 : 0) }
+  }
+
   async forkSession(params: v2.ForkSessionRequest, signal: AbortSignal): Promise<v2.ForkSessionResponse> {
     validateRoots(params)
     signal.throwIfAborted()
     const { session: source } = await translateError(() => this.agent.resumeActiveSession(params.sessionId, params.cwd))
-    let anchor: PiForkAnchor | undefined
-    if (params.cursorId != null) {
-      const { entries, leafId } = await source.proc.getEntries()
-      for (const entry of branch(entries, leafId)) {
-        const candidate = cursorAnchor(entry)
-        if (candidate && this.cursorId(params.sessionId, candidate) === params.cursorId) {
-          anchor = candidate
-          break
-        }
-      }
-      if (!anchor) throw invalid('The cursor does not identify a supported point on this Pi session branch')
-    }
+    const anchor =
+      params.cursorId == null
+        ? undefined
+        : this.findCursor(await retainedBranch(source), params.sessionId, params.cursorId).anchor
     signal.throwIfAborted()
     const fork = await source.proc.forkSnapshot(anchor)
     if (!fork) throw invalid('The cursor no longer belongs to this Pi session branch')
@@ -295,9 +323,20 @@ class PiV2Agent {
       this.agent.resumeForkedSession(fork.sessionId, params.cwd, fork.sessionFile)
     )
     const runtime = this.track(session)
-    const { entries, leafId } = await session.proc.getEntries()
-    for (const entry of branch(entries, leafId)) runtime.seen.add(entry.id)
+    for (const entry of await retainedBranch(session)) runtime.seen.add(entry.id)
     return { sessionId: fork.sessionId, configOptions: configure(configOptions) }
+  }
+
+  private findCursor(
+    entries: PiSessionEntry[],
+    sessionId: string,
+    cursorId: string
+  ): { index: number; anchor: PiForkAnchor } {
+    for (const [index, entry] of entries.entries()) {
+      const anchor = cursorAnchor(entry)
+      if (anchor && this.cursorId(sessionId, anchor) === cursorId) return { index, anchor }
+    }
+    throw invalid('The cursor does not identify a supported point on this Pi session branch')
   }
 
   private cursorId(sessionId: string, anchor: PiForkAnchor): string {
@@ -482,9 +521,8 @@ class PiV2Agent {
     }
   }
 
-  private async publishMessages(runtime: Runtime, replay: boolean): Promise<void> {
-    const { entries, leafId } = await runtime.session.proc.getEntries()
-    for (const entry of branch(entries, leafId)) {
+  private async publishMessages(runtime: Runtime, replay: boolean, history?: PiSessionEntry[]): Promise<void> {
+    for (const entry of history ?? (await retainedBranch(runtime.session))) {
       if (entry.type !== 'message' || !entry.message || (!replay && runtime.seen.has(entry.id))) continue
       const { role, content } = entry.message
       const submission = entry.clientSubmission
