@@ -31,6 +31,7 @@ function stripAnsi(s: string): string {
 type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
   | { type: 'prompt_with_id'; id?: string; message: string; images?: unknown[]; clientMessageId: string }
+  | { type: 'steer_with_id'; id?: string; message: string; clientMessageId: string }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
   // Model
@@ -284,16 +285,27 @@ export class PiRpcProcess {
   async promptWithId(message: string, clientMessageId: string, images: unknown[] = []): Promise<PiPromptInsertion> {
     const res = await this.request({ type: 'prompt_with_id', message, images, clientMessageId })
     if (!res.success) throw new Error(`pi prompt_with_id failed: ${res.error ?? JSON.stringify(res.data)}`)
-    const data = res.data as Partial<PiPromptInsertion> | null | undefined
+    return this.requireInsertion(res.data, clientMessageId, 'prompt_with_id')
+  }
+
+  async steerWithId(message: string, clientMessageId: string): Promise<PiPromptInsertion | null> {
+    const res = await this.request({ type: 'steer_with_id', message, clientMessageId })
+    if (!res.success) throw new Error(`pi steer_with_id failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const data = res.data as { receipt?: unknown } | undefined
+    return data?.receipt === null ? null : this.requireInsertion(data?.receipt, clientMessageId, 'steer_with_id')
+  }
+
+  private requireInsertion(data: unknown, clientMessageId: string, command: string): PiPromptInsertion {
+    const receipt = data as Partial<PiPromptInsertion> | null | undefined
     if (
-      data?.clientMessageId !== clientMessageId ||
-      typeof data.entryId !== 'string' ||
-      data.entryId.length === 0 ||
-      (data.disposition !== 'inserted' && data.disposition !== 'reused')
+      receipt?.clientMessageId !== clientMessageId ||
+      typeof receipt.entryId !== 'string' ||
+      receipt.entryId.length === 0 ||
+      (receipt.disposition !== 'inserted' && receipt.disposition !== 'reused')
     ) {
-      throw new Error('pi prompt_with_id returned no matching insertion receipt')
+      throw new Error(`pi ${command} returned no matching insertion receipt`)
     }
-    return { clientMessageId, entryId: data.entryId, disposition: data.disposition }
+    return { clientMessageId, entryId: receipt.entryId, disposition: receipt.disposition }
   }
 
   async abort(): Promise<void> {

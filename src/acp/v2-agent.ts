@@ -95,11 +95,65 @@ function validateRoots(params: {
   }
 }
 
+type Steering = { sessionId: string; message: string; key?: string }
+
+function parseSteering(value: unknown): Steering {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !('sessionId' in value) ||
+    typeof value.sessionId !== 'string' ||
+    !('prompt' in value) ||
+    !Array.isArray(value.prompt) ||
+    value.prompt.length === 0
+  ) {
+    throw invalid('expected a sessionId and nonempty steering prompt')
+  }
+  const meta = '_meta' in value ? value._meta : undefined
+  const steering = typeof meta === 'object' && meta !== null && 'steering' in meta ? meta.steering : undefined
+  if (
+    steering !== undefined &&
+    (typeof steering !== 'object' ||
+      steering === null ||
+      ('idleBehavior' in steering && steering.idleBehavior !== 'promptRequired'))
+  ) {
+    throw invalid('unsupported steering idle behavior')
+  }
+  const key = steering && 'idempotencyKey' in steering ? steering.idempotencyKey : undefined
+  if (key !== undefined && (typeof key !== 'string' || key.length === 0 || [...key].length > 255)) {
+    throw invalid('idempotencyKey must be a string of 1 to 255 characters')
+  }
+  const message = value.prompt
+    .map((block: unknown) => {
+      if (typeof block === 'object' && block !== null && 'type' in block) {
+        if (block.type === 'text' && 'text' in block && typeof block.text === 'string') return block.text
+        if (block.type === 'resource_link' && 'uri' in block && typeof block.uri === 'string')
+          return `
+[Context] ${block.uri}`
+      }
+      throw invalid('Pi keyed steering accepts text and resource links')
+    })
+    .join('')
+  return { sessionId: value.sessionId, message, key }
+}
+
+function nativeMessageId(sessionId: string, key: string | undefined | null): string {
+  return key == null
+    ? randomUUID()
+    : 'pi-acp-v2:' +
+        createHash('sha256')
+          .update(JSON.stringify([sessionId, key]))
+          .digest('hex')
+}
+
 class PiV2Agent {
   private readonly agent: PiAcpAgent
   private readonly sessions = new Map<string, Runtime>()
 
-  constructor(private readonly client: Pick<v2.AgentContext, 'notify' | 'request'>) {
+  constructor(
+    private readonly client: Pick<v2.AgentContext, 'notify' | 'request'>,
+    private readonly activeSteering: boolean
+  ) {
     const connection: PiAcpConnection = {
       sessionUpdate: params => this.legacyUpdate(params),
       requestPermission: params => this.permission(params)
@@ -122,7 +176,10 @@ class PiV2Agent {
       protocolVersion: 2,
       info: legacy.agentInfo ?? { name: 'pi-acp', version: 'development' },
       capabilities: { session: { prompt: { image: {} }, delete: {} } },
-      _meta: { 'nymph.ai/fabric': { keyedTextPrompts: true } }
+      _meta: {
+        'nymph.ai/fabric': { keyedTextPrompts: true, ...(this.activeSteering ? { keyedTextSteering: true } : {}) },
+        ...(this.activeSteering ? { steering: { supported: true } } : {})
+      }
     }
   }
 
@@ -190,13 +247,7 @@ class PiV2Agent {
           throw invalid('Unsupported Pi prompt content')
       }
     }
-    const messageId =
-      key == null
-        ? randomUUID()
-        : 'pi-acp-v2:' +
-          createHash('sha256')
-            .update(JSON.stringify([params.sessionId, key]))
-            .digest('hex')
+    const messageId = nativeMessageId(params.sessionId, key)
     if (runtime.receipts.has(messageId)) return { messageId }
     const submission = runtime.session.submitKeyedPrompt(message, messageId, images, signal)
     runtime.work.add(submission.completed)
@@ -208,6 +259,21 @@ class PiV2Agent {
       await this.enqueue(runtime, () => this.publishMessages(runtime, false)).catch(reportEventError)
     }
     return { messageId: receipt.clientMessageId }
+  }
+
+  async steer(params: Steering, signal: AbortSignal) {
+    const runtime = this.requireSession(params.sessionId)
+    const messageId = nativeMessageId(params.sessionId, params.key)
+    signal.throwIfAborted()
+    if (!runtime.receipts.has(messageId)) {
+      const receipt = await runtime.session.proc.steerWithId(params.message, messageId)
+      if (receipt === null) return { outcome: 'promptRequired', reason: 'noRunningTurn' }
+      runtime.receipts.add(messageId)
+      if (receipt.disposition === 'inserted') {
+        await this.enqueue(runtime, () => this.publishMessages(runtime, false)).catch(reportEventError)
+      }
+    }
+    return { outcome: 'injected', messageId }
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -422,13 +488,13 @@ function reportEventError(error: unknown): void {
   process.stderr.write(`pi-acp: v2 event failed: ${String(error)}\n`)
 }
 
-export function piAgentRouter() {
+export function piAgentRouter(activeSteering = false) {
   let active: PiV2Agent
   let dispose: (() => void) | undefined
-  const experimental = v2
+  const standard = v2
     .agent({ name: 'pi-acp' })
     .onConnect(({ client, signal }) => {
-      active = new PiV2Agent(client)
+      active = new PiV2Agent(client, activeSteering)
       dispose = () => active.dispose()
       signal.addEventListener('abort', dispose, { once: true })
     })
@@ -441,6 +507,9 @@ export function piAgentRouter() {
     .onRequest(v2.methods.agent.session.close, ctx => active.close(ctx.params.sessionId))
     .onRequest(v2.methods.agent.session.delete, ctx => active.delete(ctx.params.sessionId))
     .onRequest(v2.methods.agent.session.setConfigOption, ctx => active.setConfig(ctx.params))
+  const experimental = activeSteering
+    ? standard.onRequest('_session/steering', parseSteering, ctx => active.steer(ctx.params, ctx.signal))
+    : standard
   const router = v2
     .agentProtocolRouter()
     .withV1({

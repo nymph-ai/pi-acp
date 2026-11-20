@@ -211,6 +211,13 @@ replays retained messages from the native session branch using the original
 keyed IDs. Assistant text is delivered as a whole message when Pi records it.
 Live tool status updates use v2 tool calls.
 
+Set `PI_ACP_ACTIVE_STEERING=1` with a Pi build that provides the
+[`steer_with_id` native RPC](https://github.com/nymph-ai/pi/commit/74b30313699c6d628f945b0558e1b294c4fd3118). This adds `_session/steering` and advertises
+`_meta.steering.supported` and `_meta["nymph.ai/fabric"].keyedTextSteering`.
+The method accepts text and resource links. Pass `_meta.steering.idempotencyKey`
+and `idleBehavior: "promptRequired"` to retry safely. An idle session leaves
+new input unconsumed, and a retained receipt is reusable after restart.
+
 Cursor replay and forks, client MCP setup, additional roots, and terminal or tool replay
 are outside this preview. This mode is intended for single-owner native Pi
 sessions, including `fabd` session mode.
