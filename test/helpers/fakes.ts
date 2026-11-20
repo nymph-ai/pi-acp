@@ -1,5 +1,5 @@
 import type { AgentSideConnection } from '@agentclientprotocol/sdk'
-import type { PiRpcEvent, PiSessionStats } from '../../src/pi-rpc/process.js'
+import type { PiPromptDisposition, PiRpcEvent, PiSessionStats } from '../../src/pi-rpc/process.js'
 
 type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
 
@@ -46,8 +46,9 @@ export class FakePiRpcProcess {
     for (const h of this.handlers) h(ev)
   }
 
-  async prompt(message: string, attachments: unknown[] = []): Promise<void> {
+  async prompt(message: string, attachments: unknown[] = []): Promise<PiPromptDisposition | undefined> {
     this.prompts.push({ message, attachments })
+    return undefined
   }
 
   async abort(): Promise<void> {

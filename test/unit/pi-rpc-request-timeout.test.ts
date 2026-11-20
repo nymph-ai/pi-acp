@@ -46,6 +46,45 @@ test('PiRpcProcess: auxiliary context usage has a one-second timeout', () => {
   assert.equal(SESSION_STATS_TIMEOUT_MS, 1_000)
 })
 
+test('PiRpcProcess: keyed prompt requires a matching native insertion receipt', async () => {
+  const { child, stdout, written } = makeFakeChild()
+  const proc = makeProcess(child)
+
+  const inserted = proc.promptWithId('hello', 'client-1')
+  const first = JSON.parse(written[0]!)
+  assert.deepEqual(first, {
+    id: first.id,
+    type: 'prompt_with_id',
+    message: 'hello',
+    images: [],
+    clientMessageId: 'client-1'
+  })
+  const receipt = { clientMessageId: 'client-1', entryId: 'native-1', disposition: 'inserted' }
+  await writeLine(stdout, {
+    type: 'response',
+    id: first.id,
+    command: first.type,
+    success: true,
+    data: receipt
+  })
+  assert.deepEqual(await inserted, receipt)
+
+  for (const data of [{ disposition: 'started' }, { ...receipt, clientMessageId: 'another' }]) {
+    const retry = proc.promptWithId('hello', 'client-1')
+    const request = JSON.parse(written.at(-1)!)
+    const rejected = assert.rejects(retry, /no matching insertion receipt/)
+    await writeLine(stdout, {
+      type: 'response',
+      id: request.id,
+      command: request.type,
+      success: true,
+      data
+    })
+    await rejected
+  }
+  assert.equal(written.length, 3)
+})
+
 test('PiRpcProcess: getSessionStats without a timeout accepts a response after one second', async () => {
   const { child, stdout, written } = makeFakeChild()
   const proc = makeProcess(child)

@@ -196,6 +196,25 @@ Project layout:
 - `src/acp/*` – ACP server + translation layer
 - `src/pi-rpc/*` – pi subprocess wrapper (RPC protocol)
 
+## Experimental ACP v2
+
+Set `PI_ACP_PROTOCOL_V2=1` and point `PI_ACP_PI_COMMAND` to a Pi build
+with [native keyed prompt receipts](https://github.com/nymph-ai/pi/commit/80f9079a6251da66adae5d8c4d7b0df9372327fb).
+The experimental router accepts ACP v1 and v2. Ordinary installations default
+to v1.
+
+The v2 session methods cover create, list, resume, close, prompt, cancel, and
+updates. Prompts acknowledge native insertion and support
+`session/prompt.idempotencyKey`. The v2 initialize response advertises
+`_meta["nymph.ai/fabric"].keyedTextPrompts`. Resuming with `replayFrom: { "type": "start" }`
+replays retained messages from the native session branch using the original
+keyed IDs. Assistant text is delivered as a whole message when Pi records it.
+Live tool status updates use v2 tool calls.
+
+Cursor replay and forks, client MCP setup, additional roots, and terminal or tool replay
+are outside this preview. This mode is intended for single-owner native Pi
+sessions, including `fabd` session mode.
+
 ## Limitations
 
 - No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally.

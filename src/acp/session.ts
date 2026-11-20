@@ -15,6 +15,7 @@ import {
   PiRpcProcess,
   PiRpcSpawnError,
   SESSION_STATS_TIMEOUT_MS,
+  type PiPromptInsertion,
   type PiRpcEvent,
   type PiSessionStats
 } from '../pi-rpc/process.js'
@@ -34,19 +35,24 @@ import {
 } from './translate/bash.js'
 import { toolResultToText } from './translate/pi-tools.js'
 
+export type PiAcpConnection = Pick<AgentSideConnection, 'sessionUpdate' | 'requestPermission'>
+
 type SessionCreateParams = {
   cwd: string
   mcpServers: McpServer[]
-  conn: AgentSideConnection
+  conn: PiAcpConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
 
-type PendingTurn = {
-  resolve: (reason: StopReason) => void
-  reject: (err: unknown) => void
+type PiUserMessage = { role: 'user'; content?: unknown; timestamp?: unknown }
+type KeyedPrompt = {
+  clientMessageId: string
+  inserted: (receipt: PiPromptInsertion | null) => void
+  rejected: (error: unknown) => void
+  signal?: AbortSignal
 }
 
 type QueuedTurn = {
@@ -54,6 +60,8 @@ type QueuedTurn = {
   images: unknown[]
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
+  observeInsertion?: (message: PiUserMessage | null) => void
+  keyed?: KeyedPrompt
 }
 
 type PermissionResponse = Awaited<ReturnType<AgentSideConnection['requestPermission']>>
@@ -182,6 +190,10 @@ export class SessionManager {
     return this.sessions.get(sessionId)
   }
 
+  activeSessions(): Iterable<PiAcpSession> {
+    return this.sessions.values()
+  }
+
   /**
    * Dispose a session's underlying pi process and remove it from the manager.
    * Used when clients explicitly reload a session and we want a fresh pi subprocess.
@@ -285,7 +297,7 @@ export class PiAcpSession {
   private startupInfoSent = false
 
   readonly proc: PiRpcProcess
-  private readonly conn: AgentSideConnection
+  private readonly conn: PiAcpConnection
   private readonly fileCommands: FileSlashCommand[]
 
   // Used to map abort semantics to ACP stopReason.
@@ -293,8 +305,9 @@ export class PiAcpSession {
   private cancelRequested = false
 
   // Current in-flight turn (if any). Additional prompts are queued.
-  private pendingTurn: PendingTurn | null = null
+  private pendingTurn: QueuedTurn | null = null
   private readonly turnQueue: QueuedTurn[] = []
+  private nativeTurnFailed = false
   // Track tool call statuses and ensure they are monotonic (pending -> in_progress -> completed).
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
@@ -322,7 +335,7 @@ export class PiAcpSession {
     cwd: string
     mcpServers: McpServer[]
     proc: PiRpcProcess
-    conn: AgentSideConnection
+    conn: PiAcpConnection
     fileCommands?: FileSlashCommand[]
   }) {
     this.sessionId = opts.sessionId
@@ -356,15 +369,87 @@ export class PiAcpSession {
   }
 
   async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
+    return this.enqueuePrompt(message, images)
+  }
+
+  /**
+   * Pi's user message is an insertion receipt. The RPC response is only preflight.
+   * A null receipt means no insertion event was observed.
+   */
+  submitPrompt(
+    message: string,
+    images: unknown[] = []
+  ): {
+    inserted: Promise<PiUserMessage | null>
+    completed: Promise<StopReason>
+  } {
+    let observeInsertion!: (message: PiUserMessage | null) => void
+    const inserted = new Promise<PiUserMessage | null>(resolve => {
+      observeInsertion = resolve
+    })
+    const completed = this.enqueuePrompt(message, images, observeInsertion)
+    void completed.catch(() => observeInsertion(null))
+    return { inserted, completed }
+  }
+
+  /** Keep the key on the native command through queueing, cancellation, and reconnect. */
+  submitKeyedPrompt(
+    message: string,
+    clientMessageId: string,
+    images: unknown[] = [],
+    signal?: AbortSignal
+  ): {
+    inserted: Promise<PiPromptInsertion | null>
+    completed: Promise<StopReason>
+  } {
+    let keyed!: KeyedPrompt
+    const inserted = new Promise<PiPromptInsertion | null>((resolve, reject) => {
+      keyed = { clientMessageId, inserted: resolve, rejected: reject, signal }
+    })
+    const completed = this.enqueuePrompt(message, images, undefined, keyed)
+    return { inserted, completed }
+  }
+
+  private enqueuePrompt(
+    message: string,
+    images: unknown[],
+    observeInsertion?: QueuedTurn['observeInsertion'],
+    keyed?: KeyedPrompt
+  ): Promise<StopReason> {
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject }
+      const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject, observeInsertion, keyed }
+      const signal = keyed?.signal
+      if (signal?.aborted) {
+        keyed?.inserted(null)
+        resolve('cancelled')
+        return
+      }
 
       // If a turn is already running, enqueue.
       if (this.pendingTurn) {
         this.turnQueue.push(queued)
+        if (signal) {
+          const withdraw = () => {
+            const index = this.turnQueue.indexOf(queued)
+            if (index === -1) return
+            this.turnQueue.splice(index, 1)
+            keyed?.inserted(null)
+            queued.resolve('cancelled')
+          }
+          signal.addEventListener('abort', withdraw, { once: true })
+          const removeListener = () => signal.removeEventListener('abort', withdraw)
+          queued.resolve = reason => {
+            removeListener()
+            resolve(reason)
+          }
+          queued.reject = error => {
+            removeListener()
+            reject(error)
+          }
+        }
 
         // Best-effort: notify client that a prompt was queued.
         // This doesn't work in Zed yet, needs to be revisited
@@ -399,7 +484,11 @@ export class PiAcpSession {
 
     if (this.turnQueue.length) {
       const queued = this.turnQueue.splice(0, this.turnQueue.length)
-      for (const t of queued) t.resolve('cancelled')
+      for (const t of queued) {
+        t.observeInsertion?.(null)
+        t.keyed?.inserted(null)
+        t.resolve('cancelled')
+      }
 
       this.emit({
         sessionUpdate: 'agent_message_chunk',
@@ -457,13 +546,16 @@ export class PiAcpSession {
     await this.flushEmits()
   }
 
-  private async settleTurn(): Promise<void> {
+  private async settleTurn(turn = this.pendingTurn): Promise<void> {
+    if (turn === null || this.pendingTurn !== turn) return
     // Ensure all updates derived from pi events (plus the final usage update) are
     // delivered before we resolve the ACP `session/prompt` request.
     await this.publishContextUsage()
 
-    const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-    this.pendingTurn?.resolve(reason)
+    if (this.pendingTurn !== turn) return
+    const reason: StopReason = this.cancelRequested ? 'cancelled' : this.nativeTurnFailed ? 'error' : 'end_turn'
+    turn.observeInsertion?.(null)
+    turn.resolve(reason)
     this.pendingTurn = null
     this.inAgentLoop = false
 
@@ -539,9 +631,10 @@ export class PiAcpSession {
 
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
+    this.nativeTurnFailed = false
     this.inAgentLoop = false
 
-    this.pendingTurn = { resolve: t.resolve, reject: t.reject }
+    this.pendingTurn = t
 
     // Publish queue depth (0 because we're starting the turn now).
     this.emit({
@@ -552,30 +645,41 @@ export class PiAcpSession {
     // Kick off pi, but completion is determined by pi events, not the RPC response.
     // The prompt RPC only acknowledges acceptance; retry, compaction, or queued
     // continuations may emit multiple `agent_end` events before `agent_settled`.
-    this.proc.prompt(t.message, t.images).catch(err => {
-      // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
-      // Also ensure we flush any already-enqueued updates first.
-      void this.flushEmits().finally(() => {
-        // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
-        const authErr = maybeAuthRequiredError(err)
-        if (authErr) {
-          this.pendingTurn?.reject(authErr)
-        } else {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
-        }
-
-        this.pendingTurn = null
-        this.inAgentLoop = false
-
-        // If the prompt failed, do not automatically proceed—pi may be unhealthy.
-        // But we still clear the queueDepth metadata.
-        this.emit({
-          sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+    const keyed = t.keyed
+    const started = keyed
+      ? this.proc.promptWithId(t.message, keyed.clientMessageId, t.images).then(receipt => {
+          keyed.inserted(receipt)
+          return receipt.disposition === 'reused' ? 'handled' : undefined
         })
+      : this.proc.prompt(t.message, t.images)
+    void started
+      .then(disposition => {
+        // An extension can handle the command without a user message or a run.
+        if (disposition === 'handled') return this.settleTurn(t)
       })
-      void err
+      .catch(err => this.failTurn(t, err))
+  }
+
+  private async failTurn(turn: QueuedTurn, err: unknown): Promise<void> {
+    turn.keyed?.rejected(err)
+    await this.flushEmits()
+    if (this.pendingTurn !== turn) return
+    turn.observeInsertion?.(null)
+    const authErr = maybeAuthRequiredError(err)
+    if (authErr) turn.reject(authErr)
+    else turn.resolve(this.cancelRequested ? 'cancelled' : 'error')
+
+    this.pendingTurn = null
+    this.inAgentLoop = false
+    for (const queued of this.turnQueue.splice(0)) {
+      queued.observeInsertion?.(null)
+      queued.keyed?.rejected(err)
+      if (authErr) queued.reject(authErr)
+      else queued.resolve('error')
+    }
+    this.emit({
+      sessionUpdate: 'session_info_update',
+      _meta: { piAcp: { queueDepth: 0, running: false } }
     })
   }
 
@@ -583,6 +687,12 @@ export class PiAcpSession {
     const type = String((ev as any).type ?? '')
 
     switch (type) {
+      case 'message_end': {
+        const message = ev.message as PiUserMessage | null | undefined
+        if (message?.role === 'user') this.pendingTurn?.observeInsertion?.(message)
+        break
+      }
+
       case 'message_update': {
         const ame = (ev as any).assistantMessageEvent
 
@@ -892,6 +1002,8 @@ export class PiAcpSession {
       case 'turn_end': {
         // pi uses `turn_end` for sub-steps (e.g. tool_use) and will often start another turn.
         // Do NOT resolve the ACP `session/prompt` here; wait for `agent_settled`.
+        const message = ev.message as { role?: string; stopReason?: string } | null | undefined
+        if (message?.role === 'assistant') this.nativeTurnFailed = message.stopReason === 'error'
         break
       }
 
@@ -903,7 +1015,13 @@ export class PiAcpSession {
       }
 
       case 'agent_settled': {
+        if (ev.aborted === true) this.cancelRequested = true
         void this.settleTurn()
+        break
+      }
+
+      case 'pi_acp_process_exit': {
+        if (this.pendingTurn) void this.failTurn(this.pendingTurn, new Error(String(ev.error)))
         break
       }
 

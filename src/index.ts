@@ -1,5 +1,6 @@
 import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
 import { PiAcpAgent } from './acp/agent.js'
+import { piAgentRouter } from './acp/v2-agent.js'
 import { getPiCommand, shouldUseShellForPiCommand } from './pi-rpc/command.js'
 // Terminal Auth entrypoint. The ACP client launches the agent with `--terminal-login`.
 if (process.argv.includes('--terminal-login')) {
@@ -49,12 +50,19 @@ const output = new ReadableStream<Uint8Array>({
 
 const stream = ndJsonStream(input, output)
 
-const agent = new AgentSideConnection(conn => new PiAcpAgent(conn), stream)
+let legacyAgent: PiAcpAgent | undefined
+const router = process.env.PI_ACP_PROTOCOL_V2 === '1' ? piAgentRouter() : null
+if (router) {
+  router.connect(stream as Parameters<typeof router.connect>[0])
+} else {
+  new AgentSideConnection(conn => (legacyAgent = new PiAcpAgent(conn)), stream)
+}
 
 function shutdown() {
   try {
     // Best-effort: dispose session subprocesses when the client disconnects.
-    ;(agent as any)?.agent?.dispose?.()
+    if (router) router.dispose()
+    else legacyAgent?.dispose()
   } catch {
     // ignore
   }

@@ -30,6 +30,7 @@ function stripAnsi(s: string): string {
 
 type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
+  | { type: 'prompt_with_id'; id?: string; message: string; images?: unknown[]; clientMessageId: string }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
   // Model
@@ -51,6 +52,7 @@ type PiRpcCommand =
   | { type: 'switch_session'; id?: string; sessionPath: string }
   // Messages
   | { type: 'get_messages'; id?: string }
+  | { type: 'get_entries'; id?: string }
   // Commands
   | { type: 'get_commands'; id?: string }
 
@@ -69,6 +71,19 @@ type PiExtensionUiResponse =
   | { id: string; cancelled: true }
 
 export type PiRpcEvent = Record<string, unknown>
+export type PiPromptDisposition = 'started' | 'queued' | 'handled'
+export type PiPromptInsertion = {
+  clientMessageId: string
+  entryId: string
+  disposition: 'inserted' | 'reused'
+}
+export type PiSessionEntry = {
+  id: string
+  parentId: string | null
+  type: string
+  message?: { role: string; content: unknown }
+  clientSubmission?: { sessionId: string; messageId: string }
+}
 
 /** Maximum wait for an auxiliary context-usage update. */
 export const SESSION_STATS_TIMEOUT_MS = 1_000
@@ -143,6 +158,7 @@ export class PiRpcProcess {
       const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
+      for (const h of this.eventHandlers) h({ type: 'pi_acp_process_exit', error: err.message })
     })
 
     child.on('error', err => {
@@ -256,9 +272,28 @@ export class PiRpcProcess {
     return lines
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<void> {
+  async prompt(message: string, images: unknown[] = []): Promise<PiPromptDisposition | undefined> {
     const res = await this.request({ type: 'prompt', message, images })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const data = res.data as { disposition?: unknown } | null | undefined
+    const disposition = data?.disposition
+    if (disposition === 'started' || disposition === 'queued' || disposition === 'handled') return disposition
+    return undefined
+  }
+
+  async promptWithId(message: string, clientMessageId: string, images: unknown[] = []): Promise<PiPromptInsertion> {
+    const res = await this.request({ type: 'prompt_with_id', message, images, clientMessageId })
+    if (!res.success) throw new Error(`pi prompt_with_id failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const data = res.data as Partial<PiPromptInsertion> | null | undefined
+    if (
+      data?.clientMessageId !== clientMessageId ||
+      typeof data.entryId !== 'string' ||
+      data.entryId.length === 0 ||
+      (data.disposition !== 'inserted' && data.disposition !== 'reused')
+    ) {
+      throw new Error('pi prompt_with_id returned no matching insertion receipt')
+    }
+    return { clientMessageId, entryId: data.entryId, disposition: data.disposition }
   }
 
   async abort(): Promise<void> {
@@ -353,6 +388,16 @@ export class PiRpcProcess {
     const res = await this.request({ type: 'get_messages' })
     if (!res.success) throw new Error(`pi get_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
+  }
+
+  async getEntries(): Promise<{ entries: PiSessionEntry[]; leafId: string | null }> {
+    const res = await this.request({ type: 'get_entries' })
+    if (!res.success) throw new Error(`pi get_entries failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const data = res.data as { entries?: PiSessionEntry[]; leafId?: string | null } | null | undefined
+    if (!Array.isArray(data?.entries) || (data.leafId !== null && typeof data.leafId !== 'string')) {
+      throw new Error('Pi returned invalid native session entries')
+    }
+    return { entries: data.entries, leafId: data.leafId }
   }
 
   async getCommands(): Promise<unknown> {

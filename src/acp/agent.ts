@@ -1,7 +1,6 @@
 import {
   RequestError,
   type Agent as ACPAgent,
-  type AgentSideConnection,
   type AuthenticateRequest,
   type CancelNotification,
   type InitializeRequest,
@@ -24,7 +23,7 @@ import {
   type DeleteSessionResponse
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
-import { SessionManager, type PiAcpSession } from './session.js'
+import { SessionManager, type PiAcpConnection, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession } from './pi-sessions.js'
@@ -120,10 +119,11 @@ import { fileURLToPath } from 'node:url'
 const pkg = readNearestPackageJson(import.meta.url)
 
 export class PiAcpAgent implements ACPAgent {
-  private readonly conn: AgentSideConnection
+  private readonly conn: PiAcpConnection
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
   private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
+  private readonly keepSessions: boolean
 
   dispose(): void {
     this.sessions.disposeAll()
@@ -132,9 +132,9 @@ export class PiAcpAgent implements ACPAgent {
   // Remember recent session cwd and use it as the default filter.
   private lastSessionCwd: string | null = null
 
-  constructor(conn: AgentSideConnection, _config?: unknown) {
+  constructor(conn: PiAcpConnection, config?: { keepSessions?: boolean }) {
     this.conn = conn
-    void _config
+    this.keepSessions = config?.keepSessions === true
   }
 
   private cleanupFailedNewSession(sessionId: string, state?: any | null): void {
@@ -179,7 +179,7 @@ export class PiAcpAgent implements ACPAgent {
 
   private async restoreSession(
     sessionId: string,
-    opts?: { cwd?: string; mcpServers?: LoadSessionRequest['mcpServers'] }
+    opts?: { cwd?: string; mcpServers?: LoadSessionRequest['mcpServers']; verifyIdentity?: boolean }
   ): Promise<PiAcpSession> {
     const existing = this.sessions.maybeGet(sessionId)
     if (existing) return existing
@@ -189,10 +189,13 @@ export class PiAcpAgent implements ACPAgent {
 
     const restorePromise = (async () => {
       const stored = this.findStoredSession(sessionId)
-      if (!stored) {
+      if (!stored || (opts?.verifyIdentity && !existsSync(stored.sessionFile))) {
         throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
       }
 
+      if (opts?.verifyIdentity && opts.cwd !== stored.cwd) {
+        throw RequestError.invalidParams('cwd does not match this session')
+      }
       const cwd = opts?.cwd ?? stored.cwd
 
       let proc: PiRpcProcess
@@ -207,6 +210,18 @@ export class PiAcpAgent implements ACPAgent {
           throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
         }
         throw e
+      }
+
+      if (opts?.verifyIdentity) {
+        try {
+          const state = await proc.getState()
+          if (typeof state !== 'object' || state === null || !('sessionId' in state) || state.sessionId !== sessionId) {
+            throw RequestError.invalidParams(`Pi did not restore session: ${sessionId}`)
+          }
+        } catch (error) {
+          proc.dispose()
+          throw error
+        }
       }
 
       const fileCommands = loadSlashCommands(cwd)
@@ -231,6 +246,24 @@ export class PiAcpAgent implements ACPAgent {
     } finally {
       this.restoringSessions.delete(sessionId)
     }
+  }
+
+  getActiveSession(sessionId: string): PiAcpSession | undefined {
+    return this.sessions.maybeGet(sessionId)
+  }
+
+  closeActiveSession(sessionId: string): void {
+    this.sessions.close(sessionId)
+  }
+
+  async resumeActiveSession(sessionId: string, cwd: string) {
+    const active = this.sessions.maybeGet(sessionId)
+    if (active && active.cwd !== cwd) {
+      throw RequestError.invalidParams('cwd does not match this session')
+    }
+    const session = active ?? (await this.restoreSession(sessionId, { cwd, verifyIdentity: true }))
+    if (session.cwd !== cwd) throw RequestError.invalidParams('cwd does not match this session')
+    return { session, configOptions: (await getSessionConfiguration(session.proc)).configOptions }
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -370,15 +403,14 @@ export class PiAcpAgent implements ACPAgent {
           updateNotice
         })
 
-    if (preludeText)
-      session.setStartupInfo(preludeText)
+    if (preludeText) session.setStartupInfo(preludeText)
 
-      // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
-      // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
-      // It does NOT affect other client windows because they run in separate agent processes.
-      //
-      // (Tests sometimes stub out `this.sessions`, so guard the call.)
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
+    // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
+    // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
+    // It does NOT affect other client windows because they run in separate agent processes.
+    //
+    // (Tests sometimes stub out `this.sessions`, so guard the call.)
+    if (!this.keepSessions) this.sessions.closeAllExcept?.(session.sessionId)
 
     const response = {
       sessionId: session.sessionId,
@@ -910,9 +942,17 @@ export class PiAcpAgent implements ACPAgent {
     // ACP: filter by cwd if provided.
     // Zed currently sends `{}` (no cwd), so we default to the last session cwd to
     // emulate pi's `/resume` picker (project-scoped).
-    const all = listPiSessions()
+    const all = listPiSessions().map(({ sessionId, cwd, title, updatedAt }) => ({ sessionId, cwd, title, updatedAt }))
+    if (this.keepSessions) {
+      const retained = new Set(all.map(session => session.sessionId))
+      for (const session of this.sessions.activeSessions()) {
+        if (!retained.has(session.sessionId)) {
+          all.push({ sessionId: session.sessionId, cwd: session.cwd, title: null, updatedAt: null })
+        }
+      }
+    }
 
-    const effectiveCwd = (params as any).cwd ?? this.lastSessionCwd
+    const effectiveCwd = params.cwd ?? (this.keepSessions ? null : this.lastSessionCwd)
     const filtered = effectiveCwd ? all.filter(s => s.cwd === effectiveCwd) : all
 
     // Cursor-based pagination (opaque cursor). For MVP, we use a simple numeric offset.
@@ -1375,7 +1415,7 @@ async function getModelState(
 }
 
 async function emitConfigOptionsUpdate(
-  conn: AgentSideConnection,
+  conn: PiAcpConnection,
   sessionId: string,
   proc: PiRpcProcess
 ): Promise<SessionConfigOption[]> {
