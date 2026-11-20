@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
+import { Duplex } from 'node:stream'
 import crossSpawn from 'cross-spawn'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
 
@@ -131,12 +132,23 @@ export type PiSessionStats = {
   contextUsage?: PiContextUsage | null
 }
 
+export type PiChannelReplyScope = {
+  extension: string
+  command: string
+  socket: string
+  sessionId: string
+  source: string
+  eventId: string
+  key: string
+}
+
 type SpawnParams = {
   cwd: string
   /** Optional override for `pi` executable name/path */
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  channelReply?: PiChannelReplyScope
 }
 
 export class PiRpcProcess {
@@ -196,12 +208,13 @@ export class PiRpcProcess {
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
+    if (params.channelReply) args.push('--extension', params.channelReply.extension)
 
     // Windows cmd launchers need shell escaping; direct executables use native argv.
     const start = shouldUseShellForPiCommand(cmd) ? crossSpawn : spawn
     const child = start(cmd, args, {
       cwd: params.cwd,
-      stdio: 'pipe',
+      stdio: params.channelReply ? ['pipe', 'pipe', 'pipe', 'pipe'] : 'pipe',
       env: process.env
     }) as ChildProcessWithoutNullStreams
 
@@ -246,6 +259,22 @@ export class PiRpcProcess {
     })
 
     const proc = new PiRpcProcess(child)
+    if (params.channelReply) {
+      // Give the extension its one-use bootstrap on a private descriptor.
+      // Ordinary subprocess arguments and environment carry no delegated key.
+      const { extension: _extension, ...scope } = params.channelReply
+      const pipe = child.stdio[3]
+      try {
+        if (!(pipe instanceof Duplex)) throw new Error('Missing Pi channel reply bootstrap pipe')
+        await new Promise<void>((resolve, reject) => {
+          pipe.once('error', reject)
+          pipe.end(JSON.stringify(scope), resolve)
+        })
+      } catch (error) {
+        proc.dispose()
+        throw error
+      }
+    }
 
     // Best-effort handshake.
     // Important: pi may emit a get_state response pointing at a sessionFile in a directory

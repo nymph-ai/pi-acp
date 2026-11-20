@@ -25,7 +25,7 @@ import {
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpConnection, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
-import { PiRpcProcess } from '../pi-rpc/process.js'
+import { PiRpcProcess, type PiChannelReplyScope } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
@@ -179,7 +179,12 @@ export class PiAcpAgent implements ACPAgent {
 
   private async restoreSession(
     sessionId: string,
-    opts?: { cwd?: string; mcpServers?: LoadSessionRequest['mcpServers']; verifyIdentity?: boolean }
+    opts?: {
+      cwd?: string
+      mcpServers?: LoadSessionRequest['mcpServers']
+      verifyIdentity?: boolean
+      channelReply?: PiChannelReplyScope
+    }
   ): Promise<PiAcpSession> {
     const existing = this.sessions.maybeGet(sessionId)
     if (existing) return existing
@@ -203,6 +208,7 @@ export class PiAcpAgent implements ACPAgent {
         proc = await PiRpcProcess.spawn({
           cwd,
           sessionPath: stored.sessionFile,
+          ...(opts?.channelReply ? { channelReply: opts.channelReply } : {}),
           piCommand: process.env.PI_ACP_PI_COMMAND
         })
       } catch (e: any) {
@@ -256,12 +262,12 @@ export class PiAcpAgent implements ACPAgent {
     this.sessions.close(sessionId)
   }
 
-  async resumeActiveSession(sessionId: string, cwd: string) {
+  async resumeActiveSession(sessionId: string, cwd: string, channelReply?: PiChannelReplyScope) {
     const active = this.sessions.maybeGet(sessionId)
     if (active && active.cwd !== cwd) {
       throw RequestError.invalidParams('cwd does not match this session')
     }
-    const session = active ?? (await this.restoreSession(sessionId, { cwd, verifyIdentity: true }))
+    const session = active ?? (await this.restoreSession(sessionId, { cwd, verifyIdentity: true, channelReply }))
     if (session.cwd !== cwd) throw RequestError.invalidParams('cwd does not match this session')
     return { session, configOptions: (await getSessionConfiguration(session.proc)).configOptions }
   }

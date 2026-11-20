@@ -8,14 +8,16 @@ import { PiAcpAgent } from './agent.js'
 import { extensionUiToolCallId, type PiAcpConnection, type PiAcpSession, type StopReason } from './session.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { getPiAcpDir } from './paths.js'
-import type { PiForkAnchor, PiRpcEvent, PiSessionEntry } from '../pi-rpc/process.js'
+import type { PiChannelReplyScope, PiForkAnchor, PiRpcEvent, PiSessionEntry } from '../pi-rpc/process.js'
 import { PiToolUpdates } from './v2-tools.js'
+import { channelReplyConfiguration, channelReplyScope } from './channel-reply.js'
 
 const FABRIC_CURSOR_REPLAY = '_fabric_cursor'
 
 type StateNotification = Extract<v2.SessionUpdate, { sessionUpdate: 'state_update' }>
 type Runtime = {
   session: PiAcpSession
+  channelReply: PiChannelReplyScope | undefined
   seen: Set<string>
   receipts: Map<string, string | undefined>
   tools: PiToolUpdates
@@ -142,17 +144,20 @@ function idle(reason?: StopReason): StateNotification {
   return { sessionUpdate: 'state_update', state: 'idle', stopReason: null }
 }
 
-function validateRoots(params: {
-  cwd: string
-  additionalDirectories?: string[]
-  mcpServers?: unknown[]
-  configOptions?: unknown[]
-  systemPrompt?: unknown
-}): void {
+function validateRoots(
+  params: {
+    cwd: string
+    additionalDirectories?: string[]
+    mcpServers?: unknown[]
+    configOptions?: unknown[]
+    systemPrompt?: unknown
+  },
+  allowMcp = false
+): void {
   if (!isAbsolute(params.cwd)) throw invalid('cwd must be an absolute path')
   if (
     params.additionalDirectories?.length ||
-    params.mcpServers?.length ||
+    (!allowMcp && params.mcpServers?.length) ||
     params.configOptions?.length ||
     params.systemPrompt != null
   ) {
@@ -261,6 +266,8 @@ function cursorAnchor(entry: PiSessionEntry): PiForkAnchor | undefined {
 class PiV2Agent {
   private readonly agent: PiAcpAgent
   private readonly sessions = new Map<string, Runtime>()
+  private readonly resuming = new Set<string>()
+  private readonly channelReply = channelReplyConfiguration()
   private cursorKey?: Uint8Array
 
   constructor(
@@ -291,13 +298,21 @@ class PiV2Agent {
     return {
       protocolVersion: 2,
       info: legacy.agentInfo ?? { name: 'pi-acp', version: 'development' },
-      capabilities: { session: { prompt: { image: {} }, delete: {}, ...(this.nativeCursors ? { fork: {} } : {}) } },
+      capabilities: {
+        session: {
+          prompt: { image: {} },
+          delete: {},
+          ...(this.nativeCursors ? { fork: {} } : {}),
+          ...(this.channelReply ? { mcp: { stdio: {} } } : {})
+        }
+      },
       _meta: {
         'nymph.ai/fabric': {
           keyedTextPrompts: true,
           ...(this.typedPromptReceipts ? { keyedResourceLinkPrompts: true } : {}),
           ...(this.activeSteering ? { keyedTextSteering: true } : {}),
-          ...(this.nativeCursors ? { replayFromCursor: FABRIC_CURSOR_REPLAY } : {})
+          ...(this.nativeCursors ? { replayFromCursor: FABRIC_CURSOR_REPLAY } : {}),
+          ...(this.channelReply ? { channelReplyMcp: true } : {})
         },
         ...(this.activeSteering ? { steering: { supported: true } } : {})
       }
@@ -318,31 +333,45 @@ class PiV2Agent {
   }
 
   async resumeSession(params: v2.ResumeSessionRequest): Promise<v2.ResumeSessionResponse> {
-    validateRoots(params)
+    validateRoots(params, true)
+    const { sessionId, cwd } = params
+    const channelReply = channelReplyScope(params.mcpServers, sessionId, this.channelReply)
     const cursorId = this.replayCursorId(params.replayFrom)
-    const { session, configOptions } = await translateError(() =>
-      this.agent.resumeActiveSession(params.sessionId, params.cwd)
-    )
-    const preflight =
-      cursorId !== undefined && !this.sessions.has(params.sessionId)
-        ? await this.replayPlan(session, cursorId)
-        : undefined
-    const kept = this.sessions.get(params.sessionId)
-    const runtime = kept ?? this.track(session)
-    if (runtime.closing) throw new v2.RequestError(-32002, 'Session is closing')
-    await this.enqueue(runtime, async () => {
-      if (params.replayFrom) {
-        const plan = kept ? undefined : preflight
-        const { entries, from } = plan ?? (await this.replayPlan(session, cursorId))
-        for (const entry of entries.slice(0, from)) runtime.seen.add(entry.id)
-        await this.publishMessages(runtime, true, entries.slice(from))
-        await this.notify(runtime, { sessionUpdate: 'replay_complete' })
-      } else if (!kept) {
-        for (const entry of await retainedBranch(session)) runtime.seen.add(entry.id)
+    const kept = this.sessions.get(sessionId)
+    if (kept && !isDeepStrictEqual(kept.channelReply, channelReply)) {
+      throw invalid('Close the active Pi session before changing its channel reply scope')
+    }
+    if (this.resuming.has(sessionId)) throw invalid('Pi is already resuming this session')
+    if (!kept) this.resuming.add(sessionId)
+    try {
+      const { session, configOptions } = await translateError(() =>
+        this.agent.resumeActiveSession(sessionId, cwd, channelReply)
+      )
+      const preflight = cursorId !== undefined && !kept ? await this.replayPlan(session, cursorId) : undefined
+      const runtime = kept ?? this.track(session, channelReply)
+      if (runtime.closing) throw new v2.RequestError(-32002, 'Session is closing')
+      await this.enqueue(runtime, async () => {
+        if (params.replayFrom) {
+          const { entries, from } = preflight ?? (await this.replayPlan(session, cursorId))
+          for (const entry of entries.slice(0, from)) runtime.seen.add(entry.id)
+          await this.publishMessages(runtime, true, entries.slice(from))
+          await this.notify(runtime, { sessionUpdate: 'replay_complete' })
+        } else if (!kept) {
+          for (const entry of await retainedBranch(session)) runtime.seen.add(entry.id)
+        }
+        await this.notify(runtime, runtime.state)
+      })
+      return { configOptions: configure(configOptions) }
+    } catch (error) {
+      if (!kept) {
+        this.sessions.get(sessionId)?.unsubscribe()
+        this.sessions.delete(sessionId)
+        this.agent.closeActiveSession(sessionId)
       }
-      await this.notify(runtime, runtime.state)
-    })
-    return { configOptions: configure(configOptions) }
+      throw error
+    } finally {
+      if (!kept) this.resuming.delete(sessionId)
+    }
   }
 
   private replayCursorId(replayFrom: v2.ReplayFrom | null | undefined): string | undefined {
@@ -369,7 +398,8 @@ class PiV2Agent {
   async forkSession(params: v2.ForkSessionRequest, signal: AbortSignal): Promise<v2.ForkSessionResponse> {
     validateRoots(params)
     signal.throwIfAborted()
-    const { session: source } = await translateError(() => this.agent.resumeActiveSession(params.sessionId, params.cwd))
+    const source = this.requireSession(params.sessionId).session
+    if (source.cwd !== params.cwd) throw invalid('cwd does not match this session')
     const anchor =
       params.cursorId == null
         ? undefined
@@ -522,9 +552,10 @@ class PiV2Agent {
     return runtime
   }
 
-  private track(session: PiAcpSession): Runtime {
+  private track(session: PiAcpSession, channelReply?: PiChannelReplyScope): Runtime {
     const runtime: Runtime = {
       session,
+      channelReply,
       seen: new Set(),
       receipts: new Map(),
       tools: new PiToolUpdates(),

@@ -251,9 +251,17 @@ that user message, and an after-assistant cursor starts with its successor.
 Pi emits `replay_complete` even at the end of the branch. Unknown, stale,
 and cross-session cursors fail with `-32602`.
 
-Tool, thought, session-message and compaction anchors, client MCP setup,
-additional roots, and terminal replay are outside this preview. This mode is intended for single-owner native Pi
+Tool, thought, session-message and compaction anchors, additional roots, and
+terminal replay are outside this preview. This mode is intended for single-owner native Pi
 sessions, including `fabd` session mode.
+
+The packaged Fabric preview accepts one scoped stdio `channel_reply` MCP
+server on detached v2 resume. Set `PI_ACP_V2_CHANNEL_REPLY_COMMAND` and
+`PI_ACP_V2_CHANNEL_REPLY_SOCKET` to the absolute helper and authenticated
+fabd socket. The preview launcher supplies the bundled Pi extension through
+`PI_ACP_V2_CHANNEL_REPLY_EXTENSION`. The validated bootstrap travels on a
+private subprocess descriptor. Close the active session before changing the
+scope. A detached resume without the declaration starts Pi without the tool.
 
 ## Limitations
 
