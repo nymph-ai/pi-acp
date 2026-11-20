@@ -50,6 +50,7 @@ export type StopReason = 'end_turn' | 'cancelled' | 'error'
 type PiUserMessage = { role: 'user'; content?: unknown; timestamp?: unknown }
 type KeyedPrompt = {
   clientMessageId: string
+  clientContent?: string
   inserted: (receipt: PiPromptInsertion | null) => void
   rejected: (error: unknown) => void
   signal?: AbortSignal
@@ -397,14 +398,15 @@ export class PiAcpSession {
     message: string,
     clientMessageId: string,
     images: unknown[] = [],
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    clientContent?: string
   ): {
     inserted: Promise<PiPromptInsertion | null>
     completed: Promise<StopReason>
   } {
     let keyed!: KeyedPrompt
     const inserted = new Promise<PiPromptInsertion | null>((resolve, reject) => {
-      keyed = { clientMessageId, inserted: resolve, rejected: reject, signal }
+      keyed = { clientMessageId, clientContent, inserted: resolve, rejected: reject, signal }
     })
     const completed = this.enqueuePrompt(message, images, undefined, keyed)
     return { inserted, completed }
@@ -647,7 +649,7 @@ export class PiAcpSession {
     // continuations may emit multiple `agent_end` events before `agent_settled`.
     const keyed = t.keyed
     const started = keyed
-      ? this.proc.promptWithId(t.message, keyed.clientMessageId, t.images).then(receipt => {
+      ? this.proc.promptWithId(t.message, keyed.clientMessageId, t.images, keyed.clientContent).then(receipt => {
           keyed.inserted(receipt)
           return receipt.disposition === 'reused' ? 'handled' : undefined
         })

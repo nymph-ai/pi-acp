@@ -35,9 +35,21 @@ class Session extends FakePiRpcProcess {
     return { entries: [...this.entries], leafId: this.entries.at(-1)?.id ?? null }
   }
 
-  async promptWithId(message: string, clientMessageId: string): Promise<PiPromptInsertion> {
+  async promptWithId(
+    message: string,
+    clientMessageId: string,
+    _images?: unknown[],
+    clientContent?: string
+  ): Promise<PiPromptInsertion> {
     const retained = this.entries.find(entry => entry.clientSubmission?.messageId === clientMessageId)
-    if (retained) return { clientMessageId, entryId: retained.id, disposition: 'reused' }
+    if (retained) {
+      return {
+        clientMessageId,
+        entryId: retained.id,
+        disposition: 'reused',
+        clientContent: retained.clientSubmission?.clientContent
+      }
+    }
     this.starts++
     this.active = true
     this.emit({ type: 'agent_start' })
@@ -47,9 +59,9 @@ class Session extends FakePiRpcProcess {
       parentId: this.entries.at(-1)?.id ?? null,
       type: 'message',
       message: { role: 'user', content: message },
-      clientSubmission: { sessionId: this.id, messageId: clientMessageId }
+      clientSubmission: { sessionId: this.id, messageId: clientMessageId, clientContent }
     })
-    return { clientMessageId, entryId, disposition: 'inserted' }
+    return { clientMessageId, entryId, disposition: 'inserted', clientContent }
   }
 
   override async abort() {
@@ -124,7 +136,7 @@ test('Pi ACP v2 keeps native receipts, replays a reopened session, and cancels q
     return process
   })
   const streams = createStreams()
-  const router = piAgentRouter()
+  const router = piAgentRouter(false, false, true)
   router.connect(streams.agent)
   const updates: v2.UpdateSessionNotification[] = []
   const connection = v2
@@ -141,7 +153,7 @@ test('Pi ACP v2 keeps native receipts, replays a reopened session, and cancels q
       info: { name: 'test', version: 'test' }
     })
     assert.equal(initialized.protocolVersion, 2)
-    assert.deepEqual(initialized._meta?.['nymph.ai/fabric'], { keyedTextPrompts: true })
+    assert.deepEqual(initialized._meta?.['nymph.ai/fabric'], { keyedTextPrompts: true, keyedResourceLinkPrompts: true })
     const first = await request(methods.session.new, { cwd: directory })
     const second = await request(methods.session.new, { cwd: directory })
     const listed = await request(methods.session.list, {})
@@ -151,12 +163,18 @@ test('Pi ACP v2 keeps native receipts, replays a reopened session, and cancels q
     const params = {
       sessionId: first.sessionId,
       idempotencyKey: 'stable-key',
-      prompt: [{ type: 'text' as const, text: 'hello' }]
+      prompt: [
+        { type: 'text' as const, text: 'hello' },
+        { type: 'resource_link' as const, name: 'reference', uri: 'fixture://exact', title: 'keep me' }
+      ]
     }
     const receipt = await request(methods.session.prompt, params)
     assert.equal(spawned[0]!.starts, 1)
     assert.equal(spawned[0]!.active, true)
     assert.deepEqual(await request(methods.session.prompt, params), receipt)
+    const changed = { ...params, prompt: [...params.prompt].reverse() }
+    const invalidParams = (error: unknown) => (error as { code?: number })?.code === -32602
+    await assert.rejects(request(methods.session.prompt, changed), invalidParams)
     assert.equal(spawned[0]!.starts, 1)
 
     const queued = request(methods.session.prompt, { ...params, idempotencyKey: 'queued' })
@@ -177,8 +195,9 @@ test('Pi ACP v2 keeps native receipts, replays a reopened session, and cancels q
       replay.map(update => update.sessionUpdate),
       ['user_message', 'replay_complete', 'state_update']
     )
-    assert.equal(replay[0] && 'messageId' in replay[0] && replay[0].messageId, receipt.messageId)
+    assert.deepEqual(replay[0], { sessionUpdate: 'user_message', messageId: receipt.messageId, content: params.prompt })
     assert.deepEqual(await request(methods.session.prompt, params), receipt)
+    await assert.rejects(request(methods.session.prompt, changed), invalidParams)
     assert.equal(spawned[2]!.starts, 0)
 
     await request(methods.session.prompt, { ...params, idempotencyKey: 'fresh' })

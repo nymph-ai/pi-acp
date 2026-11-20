@@ -30,7 +30,14 @@ function stripAnsi(s: string): string {
 
 type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
-  | { type: 'prompt_with_id'; id?: string; message: string; images?: unknown[]; clientMessageId: string }
+  | {
+      type: 'prompt_with_id'
+      id?: string
+      message: string
+      images?: unknown[]
+      clientMessageId: string
+      clientContent?: string
+    }
   | { type: 'fork_snapshot'; id?: string; anchor?: PiForkAnchor }
   | { type: 'steer_with_id'; id?: string; message: string; clientMessageId: string }
   | { type: 'abort'; id?: string }
@@ -78,6 +85,7 @@ export type PiPromptInsertion = {
   clientMessageId: string
   entryId: string
   disposition: 'inserted' | 'reused'
+  clientContent?: string
 }
 export type PiForkAnchor = { entryId: string; position: 'before' | 'after' }
 export type PiForkSession = { sessionId: string; sessionFile: string }
@@ -93,7 +101,7 @@ export type PiSessionEntry = {
     isError?: unknown
     details?: unknown
   }
-  clientSubmission?: { sessionId: string; messageId: string }
+  clientSubmission?: { sessionId: string; messageId: string; clientContent?: string }
 }
 
 /** Maximum wait for an auxiliary context-usage update. */
@@ -292,8 +300,13 @@ export class PiRpcProcess {
     return undefined
   }
 
-  async promptWithId(message: string, clientMessageId: string, images: unknown[] = []): Promise<PiPromptInsertion> {
-    const res = await this.request({ type: 'prompt_with_id', message, images, clientMessageId })
+  async promptWithId(
+    message: string,
+    clientMessageId: string,
+    images: unknown[] = [],
+    clientContent?: string
+  ): Promise<PiPromptInsertion> {
+    const res = await this.request({ type: 'prompt_with_id', message, images, clientMessageId, clientContent })
     if (!res.success) throw new Error(`pi prompt_with_id failed: ${res.error ?? JSON.stringify(res.data)}`)
     return this.requireInsertion(res.data, clientMessageId, 'prompt_with_id')
   }
@@ -311,11 +324,17 @@ export class PiRpcProcess {
       receipt?.clientMessageId !== clientMessageId ||
       typeof receipt.entryId !== 'string' ||
       receipt.entryId.length === 0 ||
-      (receipt.disposition !== 'inserted' && receipt.disposition !== 'reused')
+      (receipt.disposition !== 'inserted' && receipt.disposition !== 'reused') ||
+      (receipt.clientContent !== undefined && typeof receipt.clientContent !== 'string')
     ) {
       throw new Error(`pi ${command} returned no matching insertion receipt`)
     }
-    return { clientMessageId, entryId: receipt.entryId, disposition: receipt.disposition }
+    return {
+      clientMessageId,
+      entryId: receipt.entryId,
+      disposition: receipt.disposition,
+      ...(receipt.clientContent !== undefined ? { clientContent: receipt.clientContent } : {})
+    }
   }
 
   async abort(): Promise<void> {

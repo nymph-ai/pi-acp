@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import * as acp from '@agentclientprotocol/sdk'
 import * as v2 from 'acp-v2-sdk/experimental/v2/unstable'
 import { PiAcpAgent } from './agent.js'
@@ -16,7 +17,7 @@ type StateNotification = Extract<v2.SessionUpdate, { sessionUpdate: 'state_updat
 type Runtime = {
   session: PiAcpSession
   seen: Set<string>
-  receipts: Set<string>
+  receipts: Map<string, string | undefined>
   tools: PiToolUpdates
   work: Set<Promise<StopReason>>
   output: Promise<void>
@@ -29,6 +30,53 @@ type Runtime = {
 
 function invalid(message: string): v2.RequestError {
   return v2.RequestError.invalidParams(undefined, message)
+}
+
+function originalBlocks(content: string | undefined): v2.ContentBlock[] | null | undefined {
+  if (content === undefined) return undefined
+  try {
+    const original: unknown = JSON.parse(content)
+    if (
+      typeof original !== 'object' ||
+      original === null ||
+      !('format' in original) ||
+      original.format !== 'acp-v2' ||
+      !('blocks' in original) ||
+      !Array.isArray(original.blocks)
+    )
+      return null
+    const blocks = original.blocks
+    if (
+      !blocks.every((block: unknown): block is v2.ContentBlock => {
+        if (typeof block !== 'object' || block === null || !('type' in block) || typeof block.type !== 'string')
+          return false
+        const candidate = block as v2.ContentBlock
+        return (
+          v2.ContentBlock.isText(candidate) ||
+          v2.ContentBlock.isResourceLink(candidate) ||
+          v2.ContentBlock.isImage(candidate)
+        )
+      }) ||
+      !blocks.some(v2.ContentBlock.isResourceLink)
+    )
+      return null
+    return blocks
+  } catch (error) {
+    if (error instanceof SyntaxError) return null
+    throw error
+  }
+}
+
+function matchPromptContent(retained: string | undefined, requested: string | undefined): void {
+  const previous = originalBlocks(retained)
+  if (previous === null || (previous === undefined && requested !== undefined)) {
+    throw new v2.RequestError(-32000, 'Pi has no exact native typed prompt for this key.', {
+      kind: 'pi_prompt_witness_unavailable'
+    })
+  }
+  if (!isDeepStrictEqual(previous, originalBlocks(requested))) {
+    throw invalid('This idempotency key is already bound to different typed content.')
+  }
 }
 
 async function translateError<T>(run: () => Promise<T>): Promise<T> {
@@ -212,7 +260,8 @@ class PiV2Agent {
   constructor(
     private readonly client: Pick<v2.AgentContext, 'notify' | 'request'>,
     private readonly activeSteering: boolean,
-    private readonly nativeCursors: boolean
+    private readonly nativeCursors: boolean,
+    private readonly typedPromptReceipts: boolean
   ) {
     const connection: PiAcpConnection = {
       sessionUpdate: params => this.legacyUpdate(params),
@@ -240,6 +289,7 @@ class PiV2Agent {
       _meta: {
         'nymph.ai/fabric': {
           keyedTextPrompts: true,
+          ...(this.typedPromptReceipts ? { keyedResourceLinkPrompts: true } : {}),
           ...(this.activeSteering ? { keyedTextSteering: true } : {}),
           ...(this.nativeCursors ? { replayFromCursor: FABRIC_CURSOR_REPLAY } : {})
         },
@@ -378,14 +428,22 @@ class PiV2Agent {
           throw invalid('Unsupported Pi prompt content')
       }
     }
+    const clientContent =
+      this.typedPromptReceipts && params.prompt.some(v2.ContentBlock.isResourceLink)
+        ? JSON.stringify({ format: 'acp-v2', blocks: params.prompt })
+        : undefined
     const messageId = nativeMessageId(params.sessionId, key)
-    if (runtime.receipts.has(messageId)) return { messageId }
-    const submission = runtime.session.submitKeyedPrompt(message, messageId, images, signal)
+    if (runtime.receipts.has(messageId)) {
+      if (this.typedPromptReceipts) matchPromptContent(runtime.receipts.get(messageId), clientContent)
+      return { messageId }
+    }
+    const submission = runtime.session.submitKeyedPrompt(message, messageId, images, signal, clientContent)
     runtime.work.add(submission.completed)
     void submission.completed.finally(() => runtime.work.delete(submission.completed)).catch(() => {})
     const receipt = await translateError(() => submission.inserted)
     if (receipt === null) throw v2.RequestError.requestCancelled()
-    runtime.receipts.add(receipt.clientMessageId)
+    if (this.typedPromptReceipts) matchPromptContent(receipt.clientContent, clientContent)
+    runtime.receipts.set(receipt.clientMessageId, receipt.clientContent)
     if (receipt.disposition === 'inserted') {
       await this.enqueue(runtime, () => this.publishMessages(runtime, false)).catch(reportEventError)
     }
@@ -396,10 +454,13 @@ class PiV2Agent {
     const runtime = this.requireSession(params.sessionId)
     const messageId = nativeMessageId(params.sessionId, params.key)
     signal.throwIfAborted()
-    if (!runtime.receipts.has(messageId)) {
+    if (runtime.receipts.has(messageId)) {
+      if (this.typedPromptReceipts) matchPromptContent(runtime.receipts.get(messageId), undefined)
+    } else {
       const receipt = await runtime.session.proc.steerWithId(params.message, messageId)
       if (receipt === null) return { outcome: 'promptRequired', reason: 'noRunningTurn' }
-      runtime.receipts.add(messageId)
+      if (this.typedPromptReceipts) matchPromptContent(receipt.clientContent, undefined)
+      runtime.receipts.set(messageId, receipt.clientContent)
       if (receipt.disposition === 'inserted') {
         await this.enqueue(runtime, () => this.publishMessages(runtime, false)).catch(reportEventError)
       }
@@ -459,7 +520,7 @@ class PiV2Agent {
     const runtime: Runtime = {
       session,
       seen: new Set(),
-      receipts: new Set(),
+      receipts: new Map(),
       tools: new PiToolUpdates(),
       work: new Set(),
       output: Promise.resolve(),
@@ -535,11 +596,15 @@ class PiV2Agent {
       const { role, content } = entry.message
       const submission = entry.clientSubmission
       const messageId = entryMessageId(entry)
-      if (role === 'user' && submission?.sessionId === runtime.session.sessionId) runtime.receipts.add(messageId)
+      if (role === 'user' && submission?.sessionId === runtime.session.sessionId) {
+        runtime.receipts.set(messageId, submission.clientContent)
+      }
       if (role === 'user' || role === 'assistant') {
         const text = role === 'user' ? normalizePiMessageText(content) : normalizePiAssistantText(content)
-        const blocks: v2.ContentBlock[] = text ? [{ type: 'text', text }] : []
-        if (role === 'user' && Array.isArray(content)) {
+        const original =
+          role === 'user' && this.typedPromptReceipts ? originalBlocks(submission?.clientContent) : undefined
+        const blocks: v2.ContentBlock[] = original ?? (text ? [{ type: 'text', text }] : [])
+        if (original == null && role === 'user' && Array.isArray(content)) {
           for (const part of content) {
             if (part?.type === 'image' && typeof part.data === 'string' && typeof part.mimeType === 'string') {
               blocks.push({ type: 'image', data: part.data, mimeType: part.mimeType })
@@ -631,13 +696,13 @@ function reportEventError(error: unknown): void {
   process.stderr.write(`pi-acp: v2 event failed: ${String(error)}\n`)
 }
 
-export function piAgentRouter(activeSteering = false, nativeCursors = false) {
+export function piAgentRouter(activeSteering = false, nativeCursors = false, typedPromptReceipts = false) {
   let active: PiV2Agent
   let dispose: (() => void) | undefined
   const standard = v2
     .agent({ name: 'pi-acp' })
     .onConnect(({ client, signal }) => {
-      active = new PiV2Agent(client, activeSteering, nativeCursors)
+      active = new PiV2Agent(client, activeSteering, nativeCursors, typedPromptReceipts)
       dispose = () => active.dispose()
       signal.addEventListener('abort', dispose, { once: true })
     })

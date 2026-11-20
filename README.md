@@ -215,6 +215,13 @@ The provider ID is available in `_meta["nymph.ai/fabric"].nativeToolCallId`.
 A call is pending until its retained result supplies success or failure. Pi
 does not record a separate per-tool cancellation outcome in these entries.
 
+Set `PI_ACP_TYPED_PROMPT_RECEIPTS=1` with a Pi build that supports native
+`prompt_with_id.clientContent`. The v2 preview then advertises
+`_meta["nymph.ai/fabric"].keyedResourceLinkPrompts`. It stores the original
+ordered ACP blocks on the native user entry when a prompt contains a resource
+link. Retries check those retained blocks and replay restores them. Older
+rendered-only entries can certify plain-text retries.
+
 Set `PI_ACP_ACTIVE_STEERING=1` with a Pi build that provides the
 [`steer_with_id` native RPC](https://github.com/nymph-ai/pi/commit/74b30313699c6d628f945b0558e1b294c4fd3118). This adds `_session/steering` and advertises
 `_meta.steering.supported` and `_meta["nymph.ai/fabric"].keyedTextSteering`.
